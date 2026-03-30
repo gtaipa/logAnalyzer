@@ -2,29 +2,27 @@
 #include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
-#include <unistd.h>    /* fork(), getpid() */
-#include <sys/wait.h>  /* wait() */
-#include <fcntl.h>    /* open() */
+#include <unistd.h>
+#include <sys/wait.h>
+
+#include "worker.h"
+
 int main(int argc, char *argv[]) {
 
-    /* Verificar se foram passados os argumentos obrigatórios */
+    /* Verificar argumentos obrigatórios */
     if (argc < 4) {
-        printf("O comando introduzido não conta com todos os argumentos obrigatorios.\n");
-        printf("Exemplo: %s /var/log/ 4 security --verbose\n", argv[0]);
+        printf("Uso: %s <diretorio> <num_processos> <modo> [--verbose]\n", argv[0]);
+        printf("Exemplo: %s datasets/ 4 security --verbose\n", argv[0]);
         exit(1);
     }
 
-    /* Guardar os argumentos em variáveis com nomes claros */
     char *diretorio   = argv[1];
     int num_processos = atoi(argv[2]);
     char *modo        = argv[3];
 
-    /* Verificar se o --verbose foi passado */
     int verbose = 0;
     for (int i = 4; i < argc; i++) {
-        if (strcmp(argv[i], "--verbose") == 0) {
-            verbose = 1;
-        }
+        if (strcmp(argv[i], "--verbose") == 0) verbose = 1;
     }
 
     printf("Diretorio: %s\n", diretorio);
@@ -32,138 +30,79 @@ int main(int argc, char *argv[]) {
     printf("Modo: %s\n", modo);
     printf("Verbose: %s\n", verbose ? "sim" : "nao");
 
-    /* ---- LISTA DINÂMICA DE FICHEIROS ----
-     * Em vez de um array fixo, começamos com espaço para 10 ficheiros.
-     * Se precisarmos de mais, o realloc duplica o espaço automaticamente.
-     * É como uma mochila que cresce quando fica cheia. */
+    /* ---- DESCOBRIR FICHEIROS .log ---- */
     int capacidade = 10;
     int total_ficheiros = 0;
     char **ficheiros = malloc(capacidade * sizeof(char *));
-    if (ficheiros == NULL) {
-        perror("malloc");
-        exit(1);
-    }
+    if (ficheiros == NULL) { perror("malloc"); exit(1); }
 
-    /* ---- ABRIR A PASTA E ENCONTRAR OS FICHEIROS .log ---- */
     DIR *dir = opendir(diretorio);
-    if (dir == NULL) {
-        perror("opendir");
-        exit(1);
-    }
+    if (dir == NULL) { perror("opendir"); exit(1); }
 
     struct dirent *entrada;
     while ((entrada = readdir(dir)) != NULL) {
-
         char *nome = entrada->d_name;
         int len = strlen(nome);
 
-        /* Ignorar tudo o que não terminar em .log */
         if (len > 4 && strcmp(nome + len - 4, ".log") == 0) {
-
-            /* Se a lista estiver cheia, duplicamos o espaço.
-             * Por exemplo: 10 -> 20 -> 40 -> 80... */
             if (total_ficheiros == capacidade) {
                 capacidade *= 2;
                 ficheiros = realloc(ficheiros, capacidade * sizeof(char *));
-                if (ficheiros == NULL) {
-                    perror("realloc");
-                    exit(1);
-                }
+                if (ficheiros == NULL) { perror("realloc"); exit(1); }
             }
-
-            /* Construir o caminho completo: "datasets/" + "teste.log"
-             * = "datasets/teste.log" */
             char caminho[512];
             snprintf(caminho, sizeof(caminho), "%s/%s", diretorio, nome);
-
-            /* strdup copia a string para memória própria e guarda na lista */
-            ficheiros[total_ficheiros] = strdup(caminho);
-            total_ficheiros++;
-
+            ficheiros[total_ficheiros++] = strdup(caminho);
             if (verbose) printf("Encontrei: %s\n", ficheiros[total_ficheiros - 1]);
         }
     }
-
-    /* Fechar a pasta — já não precisamos dela */
     closedir(dir);
 
     printf("Total de ficheiros .log encontrados: %d\n", total_ficheiros);
-/* Confirmar que a lista foi preenchida corretamente */
-printf("\n--- Conteudo da lista ---\n");
-for (int i = 0; i < total_ficheiros; i++) {
-    printf("ficheiros[%d] = %s\n", i, ficheiros[i]);
-}
 
-/* ---- CRIAR OS PROCESSOS FILHO COM FORK() ----
- * Vamos criar N processos filho, um por cada processo pedido.
- * Cada filho vai processar uma parte dos ficheiros da lista. */
-
-/* Calcular quantos ficheiros cada filho vai processar.
- * Exemplo: 6 ficheiros e 2 processos = 3 ficheiros por processo */
-int ficheiros_por_processo = total_ficheiros / num_processos;
-
-for (int i = 0; i < num_processos; i++) {
-
-    pid_t pid = fork(); /* o processo clona-se aqui! */
-
-    if (pid < 0) {
-        /* fork() devolveu negativo = algo correu mal */
-        perror("fork");
-        exit(1);
-
-    } else if (pid == 0) {
-        /* ---- ESTAMOS DENTRO DO FILHO ----
-         * Cada filho calcula quais ficheiros lhe pertencem
-         * com base no seu número (i) */
-
-        int inicio = i * ficheiros_por_processo;
-        int fim = (i == num_processos - 1) ? total_ficheiros : inicio + ficheiros_por_processo;
-
-        printf("[Filho %d] Vou processar %d ficheiros\n", getpid(), fim - inicio);
-
-        for (int j = inicio; j < fim; j++) {
-            printf("[Filho %d] A processar: %s\n", getpid(), ficheiros[j]);
-        }
-/* Criar o ficheiro results_<pid>.txt para escrever os resultados */
-char resultado[64];
-snprintf(resultado, sizeof(resultado), "results_%d.txt", getpid());
-
-/* open() abre ou cria o ficheiro.
- * O_WRONLY = só escrita
- * O_CREAT  = criar se não existir
- * O_TRUNC  = apagar conteúdo anterior
- * 0644     = permissões do ficheiro */
-int fd = open(resultado, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-if (fd < 0) {
-    perror("open");
-    exit(1);
-}
-
-/* Construir a mensagem de resultados */
-char msg[256];
-int len = snprintf(msg, sizeof(msg), "PID:%d;FICHEIROS:%d\n", getpid(), fim - inicio);
-
-/* write() escreve a mensagem no ficheiro */
-write(fd, msg, len);
-
-/* Fechar o ficheiro */
-close(fd);
-
-printf("[Filho %d] Resultados escritos em %s\n", getpid(), resultado);
-        exit(0); /* filho termina aqui — MUITO IMPORTANTE! */
+    if (total_ficheiros == 0) {
+        printf("Nenhum ficheiro .log encontrado em %s\n", diretorio);
+        exit(0);
     }
-    /* o pai continua o loop e cria o próximo filho */
-}
 
-/* ---- PAI ESPERA QUE TODOS OS FILHOS TERMINEM ----
- * O wait() bloqueia o pai até um filho terminar.
- * Como temos N filhos, chamamos wait() N vezes. */
-for (int i = 0; i < num_processos; i++) {
-    wait(NULL);
-}
+    /* Ajustar número de processos se houver menos ficheiros */
+    if (num_processos > total_ficheiros) {
+        num_processos = total_ficheiros;
+        printf("Ajustado para %d processo(s)\n", num_processos);
+    }
 
-printf("\n[Pai] Todos os workers terminaram!\n");
+    /* ---- CRIAR OS PROCESSOS FILHO ---- */
+    int ficheiros_por_processo = total_ficheiros / num_processos;
 
+    for (int i = 0; i < num_processos; i++) {
+        pid_t pid = fork();
+
+        if (pid < 0) {
+            perror("fork");
+            exit(1);
+
+        } else if (pid == 0) {
+            /* ---- FILHO ---- */
+            int inicio = i * ficheiros_por_processo;
+            int fim    = (i == num_processos - 1) ? total_ficheiros
+                                                   : inicio + ficheiros_por_processo;
+
+            run_worker(ficheiros, inicio, fim, verbose);
+            exit(0);
+        }
+        /* pai continua o loop */
+    }
+
+    /* ---- PAI ESPERA PELOS FILHOS ---- */
+    for (int i = 0; i < num_processos; i++) {
+        wait(NULL);
+    }
+
+    printf("\n[Pai] Todos os workers terminaram!\n");
+
+    /* Libertar memória */
+    for (int i = 0; i < total_ficheiros; i++) free(ficheiros[i]);
+    free(ficheiros);
 
     return 0;
 }
