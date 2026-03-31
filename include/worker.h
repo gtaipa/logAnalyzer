@@ -11,8 +11,9 @@
  * @param ficheiros  lista completa de ficheiros (partilhada com o pai)
  * @param inicio     índice do primeiro ficheiro a processar
  * @param fim        índice após o último ficheiro a processar
+ * @param pipe_fd    fd de escrita do pipe para enviar resultados ao pai
  * @param verbose    1 se --verbose foi passado, 0 caso contrário
  */
-void run_worker(char **ficheiros, int inicio, int fim, int verbose);
+void run_worker(char **ficheiros, int inicio, int fim, int pipe_fd, int verbose);
 
 #endif /* WORKER_H */

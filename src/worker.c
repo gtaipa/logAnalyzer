@@ -1,5 +1,6 @@
 #include "worker.h"
 #include "parser.h"
+#include "ipc.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -96,25 +97,9 @@ static void process_file(const char *path, Metrics *m, int verbose) {
     close(fd);
 }
 
-/* =========================================================
- * write_results
- *
- * Escreve as métricas acumuladas num ficheiro
- * results_<pid>.txt usando write() (sem fprintf).
- * ========================================================= */
-static void write_results(const Metrics *m, int verbose) {
-
-    char path[64];
-    snprintf(path, sizeof(path), "results_%d.txt", getpid());
-
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) {
-        perror("open results");
-        return;
-    }
-
-    /* Encontrar o IP mais frequente (top 1) */
-    char top_ip[IP_LEN] = "-";
+static void get_top_ip(const Metrics *m, char top_ip[IP_LEN]) {
+    strncpy(top_ip, "-", IP_LEN - 1);
+    top_ip[IP_LEN - 1] = '\0';
     long top_count = 0;
     for (int i = 0; i < m->ip_num; i++) {
         if (m->ip_count[i] > top_count) {
@@ -123,30 +108,31 @@ static void write_results(const Metrics *m, int verbose) {
             top_ip[IP_LEN - 1] = '\0';
         }
     }
+}
 
-    /* Formato definido no enunciado:
-     * PID:1234;LINHAS:50000;ERRORS:234;WARNINGS:1205;TOP_IP:192.168.1.100 */
-    char msg[512];
-    int len = snprintf(msg, sizeof(msg),
-        "PID:%d;LINHAS:%ld;DEBUG:%ld;INFO:%ld;WARNINGS:%ld;"
-        "ERRORS:%ld;CRITICAL:%ld;4xx:%ld;5xx:%ld;TOP_IP:%s\n",
-        getpid(),
-        m->total_lines,
-        m->count_debug,
-        m->count_info,
-        m->count_warn,
-        m->count_error,
-        m->count_critical,
-        m->count_4xx,
-        m->count_5xx,
-        top_ip
-    );
+static void send_results(int pipe_fd, const Metrics *m, int verbose) {
+    WorkerResult r;
+    r.pid = getpid();
+    r.total_lines = m->total_lines;
+    r.count_debug = m->count_debug;
+    r.count_info = m->count_info;
+    r.count_warn = m->count_warn;
+    r.count_error = m->count_error;
+    r.count_critical = m->count_critical;
+    r.count_4xx = m->count_4xx;
+    r.count_5xx = m->count_5xx;
+    get_top_ip(m, r.top_ip);
 
-    write(fd, msg, len);
-    close(fd);
+    if (writen(pipe_fd, &r, sizeof(r)) != sizeof(r)) {
+        perror("writen");
+        if (verbose) {
+            printf("[Filho %d] Erro a enviar resultados pelo pipe\n", getpid());
+        }
+        return;
+    }
 
     if (verbose) {
-        printf("[Filho %d] Resultados escritos em %s\n", getpid(), path);
+        printf("[Filho %d] Resultados enviados ao pai via pipe\n", getpid());
     }
 }
 
@@ -154,9 +140,9 @@ static void write_results(const Metrics *m, int verbose) {
  * run_worker  –  função principal do processo filho
  *
  * Chamada pelo pai após o fork(). Processa todos os
- * ficheiros da sua fatia e escreve os resultados.
+ * ficheiros da sua fatia e envia os resultados ao pai.
  * ========================================================= */
-void run_worker(char **ficheiros, int inicio, int fim, int verbose) {
+void run_worker(char **ficheiros, int inicio, int fim, int pipe_fd, int verbose) {
 
     Metrics m;
     init_metrics(&m);
@@ -167,7 +153,7 @@ void run_worker(char **ficheiros, int inicio, int fim, int verbose) {
         process_file(ficheiros[i], &m, verbose);
     }
 
-    write_results(&m, verbose);
+    send_results(pipe_fd, &m, verbose);
 
     printf("[Filho %d] Terminei. Total de linhas: %ld | Erros: %ld\n",
            getpid(), m.total_lines, m.count_error);

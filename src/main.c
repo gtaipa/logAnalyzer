@@ -6,6 +6,7 @@
 #include <sys/wait.h>
 
 #include "worker.h"
+#include "ipc.h"
 
 int main(int argc, char *argv[]) {
 
@@ -71,6 +72,13 @@ int main(int argc, char *argv[]) {
         printf("Ajustado para %d processo(s)\n", num_processos);
     }
 
+    /* ---- CRIAR PIPE PARA IPC ---- */
+    int pipe_fd[2];
+    if (pipe(pipe_fd) < 0) {
+        perror("pipe");
+        exit(1);
+    }
+
     /* ---- CRIAR OS PROCESSOS FILHO ---- */
     int ficheiros_por_processo = total_ficheiros / num_processos;
 
@@ -83,20 +91,80 @@ int main(int argc, char *argv[]) {
 
         } else if (pid == 0) {
             /* ---- FILHO ---- */
+            close(pipe_fd[0]);  /* fecha leitura no filho */
+
             int inicio = i * ficheiros_por_processo;
             int fim    = (i == num_processos - 1) ? total_ficheiros
                                                    : inicio + ficheiros_por_processo;
 
-            run_worker(ficheiros, inicio, fim, verbose);
+            run_worker(ficheiros, inicio, fim, pipe_fd[1], verbose);
+            close(pipe_fd[1]);
             exit(0);
         }
         /* pai continua o loop */
     }
 
+    /* O pai não escreve no pipe */
+    close(pipe_fd[1]);
+
+    /* Ler resultados em tempo real dos filhos */
+    WorkerResult resultado;
+    WorkerResult total = {0};
+
+    while (1) {
+        ssize_t lidos = readn(pipe_fd[0], &resultado, sizeof(resultado));
+        if (lidos < 0) {
+            perror("readn");
+            break;
+        }
+        if (lidos == 0) {
+            /* EOF: todos os filhos fecharam a extremidade de escrita */
+            break;
+        }
+        if (lidos != sizeof(resultado)) {
+            fprintf(stderr, "[Pai] Leu %zd bytes incompletos do pipe (esperado %zu)\n", lidos, sizeof(resultado));
+            break;
+        }
+
+        printf("[Pai] Recebi do filho %d: LINHAS=%ld DEBUG=%ld INFO=%ld WARNINGS=%ld ERRORS=%ld CRITICAL=%ld 4xx=%ld 5xx=%ld TOP_IP=%s\n",
+               resultado.pid,
+               resultado.total_lines,
+               resultado.count_debug,
+               resultado.count_info,
+               resultado.count_warn,
+               resultado.count_error,
+               resultado.count_critical,
+               resultado.count_4xx,
+               resultado.count_5xx,
+               resultado.top_ip);
+
+        total.total_lines    += resultado.total_lines;
+        total.count_debug    += resultado.count_debug;
+        total.count_info     += resultado.count_info;
+        total.count_warn     += resultado.count_warn;
+        total.count_error    += resultado.count_error;
+        total.count_critical += resultado.count_critical;
+        total.count_4xx      += resultado.count_4xx;
+        total.count_5xx      += resultado.count_5xx;
+    }
+
+    close(pipe_fd[0]);
+
     /* ---- PAI ESPERA PELOS FILHOS ---- */
     for (int i = 0; i < num_processos; i++) {
         wait(NULL);
     }
+
+    printf("\n[Pai] Todos os workers terminaram!\n");
+    printf("[Pai] Agregado: LINHAS=%ld DEBUG=%ld INFO=%ld WARNINGS=%ld ERRORS=%ld CRITICAL=%ld 4xx=%ld 5xx=%ld\n",
+           total.total_lines,
+           total.count_debug,
+           total.count_info,
+           total.count_warn,
+           total.count_error,
+           total.count_critical,
+           total.count_4xx,
+           total.count_5xx);
 
     printf("\n[Pai] Todos os workers terminaram!\n");
 
