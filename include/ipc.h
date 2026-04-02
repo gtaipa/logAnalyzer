@@ -7,6 +7,11 @@
 #include "parser.h"  /* IP_LEN */
 
 /* =========================================================
+ * Path do socket Unix Domain
+ * ========================================================= */
+#define SOCKET_PATH "/tmp/loganalyzer.sock"
+
+/* =========================================================
  * Estrutura enviada do filho para o pai — resultados finais
  * ========================================================= */
 typedef struct {
@@ -24,19 +29,40 @@ typedef struct {
 
 /* =========================================================
  * Estrutura enviada do filho para o pai — progresso
- * Enviada periodicamente via pipe de progresso
  * ========================================================= */
 typedef struct {
     pid_t pid;
-    int   worker_index;   /* índice do worker (0, 1, 2, ...) */
-    long  lines_done;     /* linhas processadas até agora     */
-    long  lines_total;    /* total estimado de linhas         */
+    int   worker_index;
+    long  lines_done;
+    long  lines_total;
 } ProgressUpdate;
 
 /* =========================================================
- * Funções auxiliares de I/O
+ * Funções auxiliares de I/O (garantem leitura/escrita total)
  * ========================================================= */
 ssize_t readn(int fd, void *buf, size_t count);
 ssize_t writen(int fd, const void *buf, size_t count);
+
+/* =========================================================
+ * Funções de Unix Domain Sockets
+ * ========================================================= */
+
+/**
+ * Cria o socket servidor, faz bind() e listen().
+ * Retorna o fd do socket servidor, ou -1 em erro.
+ */
+int create_server_socket(void);
+
+/**
+ * Aceita uma ligação de um cliente.
+ * Retorna o fd do cliente aceite, ou -1 em erro.
+ */
+int accept_client(int server_fd);
+
+/**
+ * Liga ao socket servidor (usado pelos filhos).
+ * Retorna o fd do socket ligado, ou -1 em erro.
+ */
+int connect_to_server(void);
 
 #endif /* IPC_H */
