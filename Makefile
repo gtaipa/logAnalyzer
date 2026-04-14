@@ -1,12 +1,19 @@
- CC = gcc
+CC = gcc
 CFLAGS = -Wall -Wextra -I./include
-SRC = src/main.c src/parser.c src/worker.c src/ipc.c
-TARGET = logAnalyzer
 
-all: $(TARGET)
+SOCKET_SRC = src/main_sockets.c src/parser.c src/worker_sockets.c src/ipc.c
+PIPES_SRC  = src/main_pipes.c src/parser.c src/worker_pipes.c
 
-$(TARGET): $(SRC)
-	$(CC) $(CFLAGS) -o $(TARGET) $(SRC)
+all: sockets pipes
+
+sockets: logAnalyzer_sockets
+pipes: logAnalyzer_pipes
+
+logAnalyzer_sockets: $(SOCKET_SRC)
+	$(CC) $(CFLAGS) -o $@ $(SOCKET_SRC)
+
+logAnalyzer_pipes: $(PIPES_SRC)
+	$(CC) $(CFLAGS) -o $@ $(PIPES_SRC)
 
 clean:
-	rm -f $(TARGET)
+	rm -f logAnalyzer_sockets logAnalyzer_pipes

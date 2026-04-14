@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <time.h>
+#include <errno.h>
 
 #include "worker.h"
 #include "ipc.h"
@@ -221,35 +222,78 @@ int main(int argc, char *argv[]) {
 
         /* Ler mensagens deste filho até fechar a ligação */
         MsgHeader hdr;
-        while (readn(client_fd, &hdr, sizeof(hdr)) == (ssize_t)sizeof(hdr)) {
+        while (1) {
+            char *hdr_ptr = (char *)&hdr;
+            size_t hdr_left = sizeof(hdr);
+            while (hdr_left > 0) {
+                ssize_t n = read(client_fd, hdr_ptr, hdr_left);
+                if (n == 0) break;
+                if (n < 0) {
+                    if (errno == EINTR) continue;
+                    perror("read");
+                    hdr_left = 1;
+                    break;
+                }
+                hdr_left -= n;
+                hdr_ptr += n;
+            }
+            if (hdr_left > 0) break;
 
             if (hdr.type == MSG_PROGRESS) {
                 ProgressUpdate pu;
-                if (readn(client_fd, &pu, sizeof(pu)) == (ssize_t)sizeof(pu)) {
-                    int idx = pu.worker_index;
-                    if (idx >= 0 && idx < g_num_workers) {
-                        worker_status[idx].pid        = pu.pid;
-                        worker_status[idx].lines_done  = pu.lines_done;
-                        worker_status[idx].lines_total = pu.lines_total;
+                char *pu_ptr = (char *)&pu;
+                size_t pu_left = sizeof(pu);
+                while (pu_left > 0) {
+                    ssize_t n = read(client_fd, pu_ptr, pu_left);
+                    if (n == 0) break;
+                    if (n < 0) {
+                        if (errno == EINTR) continue;
+                        perror("read");
+                        pu_left = 1;
+                        break;
                     }
+                    pu_left -= n;
+                    pu_ptr += n;
+                }
+                if (pu_left > 0) break;
+
+                int idx = pu.worker_index;
+                if (idx >= 0 && idx < g_num_workers) {
+                    worker_status[idx].pid        = pu.pid;
+                    worker_status[idx].lines_done  = pu.lines_done;
+                    worker_status[idx].lines_total = pu.lines_total;
                 }
             } else if (hdr.type == MSG_RESULT) {
                 WorkerResult r;
-                if (readn(client_fd, &r, sizeof(r)) == (ssize_t)sizeof(r)) {
-                    if (verbose)
-                        printf("[Pai] Recebi do filho %d: LINHAS=%ld ERRORS=%ld TOP_IP=%s\n",
-                               r.pid, r.total_lines, r.count_error, r.top_ip);
-
-                    total.total_lines    += r.total_lines;
-                    total.count_debug    += r.count_debug;
-                    total.count_info     += r.count_info;
-                    total.count_warn     += r.count_warn;
-                    total.count_error    += r.count_error;
-                    total.count_critical += r.count_critical;
-                    total.count_4xx      += r.count_4xx;
-                    total.count_5xx      += r.count_5xx;
-                    g_total_errors        = total.count_error;
+                char *r_ptr = (char *)&r;
+                size_t r_left = sizeof(r);
+                while (r_left > 0) {
+                    ssize_t n = read(client_fd, r_ptr, r_left);
+                    if (n == 0) break;
+                    if (n < 0) {
+                        if (errno == EINTR) continue;
+                        perror("read");
+                        r_left = 1;
+                        break;
+                    }
+                    r_left -= n;
+                    r_ptr += n;
                 }
+                if (r_left > 0) break;
+
+                if (verbose)
+                    printf("[Pai] Recebi do filho %d: LINHAS=%ld ERRORS=%ld TOP_IP=%s\n",
+                           r.pid, r.total_lines, r.count_error, r.top_ip);
+
+                total.total_lines    += r.total_lines;
+                total.count_debug    += r.count_debug;
+                total.count_info     += r.count_info;
+                total.count_warn     += r.count_warn;
+                total.count_error    += r.count_error;
+                total.count_critical += r.count_critical;
+                total.count_4xx      += r.count_4xx;
+                total.count_5xx      += r.count_5xx;
+                g_total_errors        = total.count_error;
             }
         }
 

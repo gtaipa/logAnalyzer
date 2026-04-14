@@ -38,12 +38,7 @@ typedef struct {
 } ProgressUpdate;
 
 /* =========================================================
- * Funções auxiliares de I/O (garantem leitura/escrita total)
- * ========================================================= */
-ssize_t readn(int fd, void *buf, size_t count);
-ssize_t writen(int fd, const void *buf, size_t count);
 
-/* =========================================================
  * Funções de Unix Domain Sockets
  * ========================================================= */
 

@@ -2,6 +2,7 @@
 #include "parser.h"
 #include "ipc.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,7 +16,7 @@
 #define LINE_MAX          512
 #define PROGRESS_INTERVAL 100
 
-/* Tipos de mensagem — têm de coincidir com o main.c */
+/* Tipos de mensagem — têm de coincidir com o main_sockets.c */
 #define MSG_PROGRESS 1
 #define MSG_RESULT   2
 
@@ -43,14 +44,36 @@ static long count_lines(const char *path) {
 static void send_progress(int sock_fd, int worker_index,
                            long lines_done, long lines_total) {
     MsgHeader hdr = { MSG_PROGRESS };
-    writen(sock_fd, &hdr, sizeof(hdr));
+    const char *ptr = (const char *)&hdr;
+    size_t left = sizeof(hdr);
+    while (left > 0) {
+        ssize_t n = write(sock_fd, ptr, left);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            perror("write");
+            return;
+        }
+        left -= n;
+        ptr += n;
+    }
 
     ProgressUpdate pu;
     pu.pid          = getpid();
     pu.worker_index = worker_index;
     pu.lines_done   = lines_done;
     pu.lines_total  = lines_total;
-    writen(sock_fd, &pu, sizeof(pu));
+    ptr = (const char *)&pu;
+    left = sizeof(pu);
+    while (left > 0) {
+        ssize_t n = write(sock_fd, ptr, left);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            perror("write");
+            return;
+        }
+        left -= n;
+        ptr += n;
+    }
 }
 
 /* =========================================================
@@ -164,7 +187,19 @@ void run_worker(char **ficheiros, int inicio, int fim,
 
     /* Enviar resultado final */
     MsgHeader hdr = { MSG_RESULT };
-    writen(sock_fd, &hdr, sizeof(hdr));
+    const char *ptr = (const char *)&hdr;
+    size_t left = sizeof(hdr);
+    while (left > 0) {
+        ssize_t n = write(sock_fd, ptr, left);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            perror("write");
+            close(sock_fd);
+            exit(1);
+        }
+        left -= n;
+        ptr += n;
+    }
 
     WorkerResult r;
     r.pid            = getpid();
@@ -177,7 +212,19 @@ void run_worker(char **ficheiros, int inicio, int fim,
     r.count_4xx      = m.count_4xx;
     r.count_5xx      = m.count_5xx;
     get_top_ip(&m, r.top_ip);
-    writen(sock_fd, &r, sizeof(r));
+    ptr = (const char *)&r;
+    left = sizeof(r);
+    while (left > 0) {
+        ssize_t n = write(sock_fd, ptr, left);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            perror("write");
+            close(sock_fd);
+            exit(1);
+        }
+        left -= n;
+        ptr += n;
+    }
 
     if (verbose)
         printf("[Filho %d] Resultados enviados ao pai via socket\n", getpid());
