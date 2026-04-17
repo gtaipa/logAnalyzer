@@ -1,10 +1,10 @@
 #include "ipc.h"
-
 #include <unistd.h>
 #include <string.h>
 #include <stdio.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <errno.h> 
 
 /* =========================================================
  * create_server_socket
@@ -91,4 +91,52 @@ int connect_to_server(void) {
     perror("connect");
     close(fd);
     return -1;
+}
+
+/* =========================================================
+ * readn - Lê exatamente 'n' bytes do descritor 'fd'
+ * ========================================================= */
+ssize_t readn(int fd, void *ptr, size_t n) {
+    size_t nleft = n;
+    ssize_t nread;
+    char *p = ptr;
+
+    while (nleft > 0) {
+        if ((nread = read(fd, p, nleft)) < 0) {
+            if (errno == EINTR) {
+                nread = 0;  /* Interrompido por um sinal, tenta de novo */
+            } else {
+                return -1;  /* Erro real */
+            }
+        } else if (nread == 0) {
+            break;          /* Fim do ficheiro (EOF) - a ligação fechou */
+        }
+
+        nleft -= nread;
+        p += nread;
+    }
+    return (n - nleft);     /* Retorna quantos bytes leu na realidade */
+}
+
+/* =========================================================
+ * writen - Escreve exatamente 'n' bytes no descritor 'fd'
+ * ========================================================= */
+ssize_t writen(int fd, const void *ptr, size_t n) {
+    size_t nleft = n;
+    ssize_t nwritten;
+    const char *p = ptr;
+
+    while (nleft > 0) {
+        if ((nwritten = write(fd, p, nleft)) <= 0) {
+            if (nwritten < 0 && errno == EINTR) {
+                nwritten = 0; /* Interrompido por um sinal, tenta de novo */
+            } else {
+                return -1;    /* Erro real */
+            }
+        }
+
+        nleft -= nwritten;
+        p += nwritten;
+    }
+    return n;
 }

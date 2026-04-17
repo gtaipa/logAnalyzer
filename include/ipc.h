@@ -59,5 +59,8 @@ int accept_client(int server_fd);
  * Retorna o fd do socket ligado, ou -1 em erro.
  */
 int connect_to_server(void);
+/* Funções de leitura e escrita seguras */
+ssize_t readn(int fd, void *ptr, size_t n);
+ssize_t writen(int fd, const void *ptr, size_t n);
 
 #endif /* IPC_H */

@@ -9,22 +9,15 @@
 #include <unistd.h>
 #include <fcntl.h>
 
-/* =========================================================
- * Constantes internas
- * ========================================================= */
 #define BUF_SIZE         4096
 #define LINE_MAX          512
 #define PROGRESS_INTERVAL 100
 
-/* Tipos de mensagem — têm de coincidir com o main_sockets.c */
 #define MSG_PROGRESS 1
 #define MSG_RESULT   2
 
 typedef struct { int type; } MsgHeader;
 
-/* =========================================================
- * count_lines
- * ========================================================= */
 static long count_lines(const char *path) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) return 0;
@@ -38,56 +31,26 @@ static long count_lines(const char *path) {
     return count;
 }
 
-/* =========================================================
- * send_progress — envia ProgressUpdate ao pai
- * ========================================================= */
-static void send_progress(int sock_fd, int worker_index,
-                           long lines_done, long lines_total) {
+/* Aqui usamos o nosso novo writen! Fica muito mais limpo. */
+static void send_progress(int sock_fd, int worker_index, long lines_done, long lines_total) {
     MsgHeader hdr = { MSG_PROGRESS };
-    const char *ptr = (const char *)&hdr;
-    size_t left = sizeof(hdr);
-    while (left > 0) {
-        ssize_t n = write(sock_fd, ptr, left);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            perror("write");
-            return;
-        }
-        left -= n;
-        ptr += n;
-    }
+    if (writen(sock_fd, &hdr, sizeof(hdr)) < 0) return;
 
     ProgressUpdate pu;
     pu.pid          = getpid();
     pu.worker_index = worker_index;
     pu.lines_done   = lines_done;
     pu.lines_total  = lines_total;
-    ptr = (const char *)&pu;
-    left = sizeof(pu);
-    while (left > 0) {
-        ssize_t n = write(sock_fd, ptr, left);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            perror("write");
-            return;
-        }
-        left -= n;
-        ptr += n;
-    }
+    if (writen(sock_fd, &pu, sizeof(pu)) < 0) return;
 }
 
-/* =========================================================
- * process_file
- * ========================================================= */
 static void process_file(const char *path, Metrics *m, int verbose,
                          int sock_fd, int worker_index,
                          long *lines_done, long lines_total) {
-
     int fd = open(path, O_RDONLY);
     if (fd < 0) { perror("open"); return; }
 
-    if (verbose)
-        printf("[Filho %d] A abrir: %s\n", getpid(), path);
+    if (verbose) printf("[Filho %d] A abrir: %s\n", getpid(), path);
 
     char buf[BUF_SIZE];
     char line[LINE_MAX];
@@ -98,27 +61,22 @@ static void process_file(const char *path, Metrics *m, int verbose,
     while ((bytes_read = read(fd, buf, BUF_SIZE)) > 0) {
         for (ssize_t b = 0; b < bytes_read; b++) {
             char c = buf[b];
-
             if (c == '\n' || c == '\r') {
                 if (line_len == 0) continue;
                 line[line_len] = '\0';
 
-                if (fmt == FORMAT_UNKNOWN)
-                    fmt = detect_format(line);
+                if (fmt == FORMAT_UNKNOWN) fmt = detect_format(line);
 
                 LogEntry entry;
-                if (parse_line(line, fmt, &entry) == 0)
-                    update_metrics(m, &entry);
+                if (parse_line(line, fmt, &entry) == 0) update_metrics(m, &entry);
 
                 line_len = 0;
                 (*lines_done)++;
 
                 if (sock_fd >= 0 && (*lines_done % PROGRESS_INTERVAL) == 0)
                     send_progress(sock_fd, worker_index, *lines_done, lines_total);
-
             } else {
-                if (line_len < LINE_MAX - 1)
-                    line[line_len++] = c;
+                if (line_len < LINE_MAX - 1) line[line_len++] = c;
             }
         }
     }
@@ -127,8 +85,7 @@ static void process_file(const char *path, Metrics *m, int verbose,
         line[line_len] = '\0';
         if (fmt == FORMAT_UNKNOWN) fmt = detect_format(line);
         LogEntry entry;
-        if (parse_line(line, fmt, &entry) == 0)
-            update_metrics(m, &entry);
+        if (parse_line(line, fmt, &entry) == 0) update_metrics(m, &entry);
         (*lines_done)++;
     }
 
@@ -136,9 +93,6 @@ static void process_file(const char *path, Metrics *m, int verbose,
     close(fd);
 }
 
-/* =========================================================
- * get_top_ip
- * ========================================================= */
 static void get_top_ip(const Metrics *m, char top_ip[IP_LEN]) {
     strncpy(top_ip, "-", IP_LEN - 1);
     top_ip[IP_LEN - 1] = '\0';
@@ -152,16 +106,9 @@ static void get_top_ip(const Metrics *m, char top_ip[IP_LEN]) {
     }
 }
 
-/* =========================================================
- * run_worker
- * ========================================================= */
-void run_worker(char **ficheiros, int inicio, int fim,
-                int worker_index, int verbose) {
-
+void run_worker(char **ficheiros, int inicio, int fim, int worker_index, int verbose) {
     Metrics m;
     init_metrics(&m);
-
-    printf("[Filho %d] Vou processar %d ficheiro(s)\n", getpid(), fim - inicio);
 
     /* Ligar ao servidor (pai) */
     int sock_fd = connect_to_server();
@@ -172,34 +119,19 @@ void run_worker(char **ficheiros, int inicio, int fim,
 
     /* Estimar total de linhas */
     long lines_total = 0;
-    for (int i = inicio; i < fim; i++)
-        lines_total += count_lines(ficheiros[i]);
-
+    for (int i = inicio; i < fim; i++) lines_total += count_lines(ficheiros[i]);
     long lines_done = 0;
 
     /* Processar ficheiros */
     for (int i = inicio; i < fim; i++)
-        process_file(ficheiros[i], &m, verbose,
-                     sock_fd, worker_index, &lines_done, lines_total);
+        process_file(ficheiros[i], &m, verbose, sock_fd, worker_index, &lines_done, lines_total);
 
     /* Enviar update final de progresso (100%) */
     send_progress(sock_fd, worker_index, lines_total, lines_total);
 
-    /* Enviar resultado final */
+    /* Enviar resultado final (Usando o writen!) */
     MsgHeader hdr = { MSG_RESULT };
-    const char *ptr = (const char *)&hdr;
-    size_t left = sizeof(hdr);
-    while (left > 0) {
-        ssize_t n = write(sock_fd, ptr, left);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            perror("write");
-            close(sock_fd);
-            exit(1);
-        }
-        left -= n;
-        ptr += n;
-    }
+    if (writen(sock_fd, &hdr, sizeof(hdr)) < 0) { perror("write"); close(sock_fd); exit(1); }
 
     WorkerResult r;
     r.pid            = getpid();
@@ -212,25 +144,8 @@ void run_worker(char **ficheiros, int inicio, int fim,
     r.count_4xx      = m.count_4xx;
     r.count_5xx      = m.count_5xx;
     get_top_ip(&m, r.top_ip);
-    ptr = (const char *)&r;
-    left = sizeof(r);
-    while (left > 0) {
-        ssize_t n = write(sock_fd, ptr, left);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            perror("write");
-            close(sock_fd);
-            exit(1);
-        }
-        left -= n;
-        ptr += n;
-    }
-
-    if (verbose)
-        printf("[Filho %d] Resultados enviados ao pai via socket\n", getpid());
+    
+    if (writen(sock_fd, &r, sizeof(r)) < 0) { perror("write"); close(sock_fd); exit(1); }
 
     close(sock_fd);
-
-    printf("[Filho %d] Terminei. Total de linhas: %ld | Erros: %ld\n",
-           getpid(), m.total_lines, m.count_error);
 }
