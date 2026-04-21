@@ -5,6 +5,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <time.h>
+#include <fcntl.h>
 
 #include "worker_prodcons.h"
 #include "parser.h"
@@ -12,44 +13,57 @@
 int produtores_ativos = 1;
 
 void gerar_relatorio_prodcons(Metrics *total, char *modo, char *output_file) {
-    FILE *out = stdout;
-    FILE *f = NULL;
+    int fd_out = STDOUT_FILENO; 
+    int fd_file = -1;
 
     if (output_file != NULL) {
-        f = fopen(output_file, "w");
-        if (f) {
-            out = f;
+        // Abre (ou cria) o ficheiro usando a system call POSIX
+        fd_file = open(output_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd_file >= 0) {
+            fd_out = fd_file; // Passamos a escrever para este descritor
             printf("\n[INFO] A gravar relatorio no ficheiro: %s\n", output_file);
+        } else {
+            perror("Erro ao abrir ficheiro de output");
         }
     }
 
-    fprintf(out, "\n=== RELATORIO FINAL PRODUTOR-CONSUMIDOR (%s) ===\n", modo);
-    fprintf(out, "Total de linhas : %ld\n", total->total_lines);
+    char buffer[4096];
+    int len = 0;
+
+    // Constrói a string no buffer na memória
+    len += snprintf(buffer + len, sizeof(buffer) - len, "\n=== RELATORIO FINAL PRODUTOR-CONSUMIDOR (%s) ===\n", modo);
+    len += snprintf(buffer + len, sizeof(buffer) - len, "Total de linhas : %ld\n", total->total_lines);
 
     if (strcmp(modo, "security") == 0 || strcmp(modo, "full") == 0) {
-        fprintf(out, "\n--- ALERTAS DE SEGURANCA ---\n");
-        fprintf(out, "DEBUG           : %ld\n", total->count_debug);
-        fprintf(out, "INFO            : %ld\n", total->count_info);
-        fprintf(out, "WARNINGS        : %ld\n", total->count_warn);
-        fprintf(out, "ERRORS          : %ld\n", total->count_error);
-        fprintf(out, "CRITICAL        : %ld\n", total->count_critical);
+        len += snprintf(buffer + len, sizeof(buffer) - len, "\n--- ALERTAS DE SEGURANCA ---\n");
+        len += snprintf(buffer + len, sizeof(buffer) - len, "DEBUG           : %ld\n", total->count_debug);
+        len += snprintf(buffer + len, sizeof(buffer) - len, "INFO            : %ld\n", total->count_info);
+        len += snprintf(buffer + len, sizeof(buffer) - len, "WARNINGS        : %ld\n", total->count_warn);
+        len += snprintf(buffer + len, sizeof(buffer) - len, "ERRORS          : %ld\n", total->count_error);
+        len += snprintf(buffer + len, sizeof(buffer) - len, "CRITICAL        : %ld\n", total->count_critical);
     }
     
     if (strcmp(modo, "traffic") == 0 || strcmp(modo, "full") == 0) {
-        fprintf(out, "\n--- ESTATISTICAS DE TRAFEGO ---\n");
-        fprintf(out, "HTTP 4xx        : %ld\n", total->count_4xx);
-        fprintf(out, "HTTP 5xx        : %ld\n", total->count_5xx);
+        len += snprintf(buffer + len, sizeof(buffer) - len, "\n--- ESTATISTICAS DE TRAFEGO ---\n");
+        len += snprintf(buffer + len, sizeof(buffer) - len, "HTTP 4xx        : %ld\n", total->count_4xx);
+        len += snprintf(buffer + len, sizeof(buffer) - len, "HTTP 5xx        : %ld\n", total->count_5xx);
     }
 
     if (strcmp(modo, "full") == 0) {
-        fprintf(out, "\n--- TOP IPs ---\n");
+        len += snprintf(buffer + len, sizeof(buffer) - len, "\n--- TOP IPs ---\n");
         for (int i = 0; i < total->ip_num && i < 10; i++) {
-            fprintf(out, "%s : %ld accesos\n", total->ip_list[i], total->ip_count[i]);
+            len += snprintf(buffer + len, sizeof(buffer) - len, "%s : %ld accesos\n", total->ip_list[i], total->ip_count[i]);
         }
     }
 
-    fprintf(out, "================================================\n");
-    if (f) fclose(f);
+    len += snprintf(buffer + len, sizeof(buffer) - len, "================================================\n");
+
+    // Faz um único write com todo o conteúdo!
+    if (write(fd_out, buffer, len) < 0) {
+        perror("Erro ao escrever relatorio");
+    }
+
+    if (fd_file >= 0) close(fd_file);
 }
 
 int main(int argc, char *argv[]) {

@@ -2,7 +2,7 @@ CC = gcc
 CFLAGS = -Wall -Wextra -pthread -I./include
 
 SOCKET_SRC = src/main_sockets.c src/parser.c src/worker_sockets.c src/ipc.c
-PIPES_SRC  = src/main_pipes.c src/parser.c src/worker_pipes.c
+PIPES_SRC  = src/main_pipes.c src/parser.c src/worker_pipes.c src/ipc.c
 THREADS_SRC = src/main_threads.c src/parser.c src/worker_threads.c
 PRODCONS_SRC = src/main_prodcons.c src/parser.c src/worker_prodcons.c
 
@@ -26,4 +26,5 @@ logAnalyzer_prodcons: $(PRODCONS_SRC)
 	$(CC) $(CFLAGS) -o $@ $(PRODCONS_SRC)
 
 clean:
-	rm -f logAnalyzer_sockets logAnalyzer_pipes logAnalyzer_threads logAnalyzer_prodcons  # isto faz com que o comando make clean excute este codigo apagando todo o conteudo 
+	rm -f logAnalyzer_sockets logAnalyzer_pipes logAnalyzer_threads logAnalyzer_prodcons
+	rm -f results_*.txt meu_relatorio.txt
