@@ -108,7 +108,9 @@ int main(int argc, char *argv[]) {
 
     WorkerResult total = {0};
     WorkerResult result;
-    while (read(fd[0], &result, sizeof(result)) > 0) {
+    
+    // AQUI: read alterado para readn
+    while (readn(fd[0], &result, sizeof(result)) > 0) {
         printf("[PAI] Recebi dados do Filho %d\n", result.pid);
         total.total_lines    += result.total_lines;
         total.count_debug    += result.count_debug;

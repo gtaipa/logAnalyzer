@@ -14,6 +14,10 @@ typedef struct {
     
     Metrics *global_metrics;  // Apontador para a variável global de resultados
     pthread_mutex_t *mutex;   // Apontador para o cadeado (mutex)
+    
+    // NOVOS CAMPOS PARA O DASHBOARD:
+    long *lines_done;         // Apontador para partilhar linhas lidas
+    long *lines_total;        // Apontador para partilhar o total de linhas a ler
 } ThreadArgs;
 
 /* Protótipo da função que a thread vai executar */

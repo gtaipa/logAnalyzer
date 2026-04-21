@@ -38,6 +38,7 @@ static void process_file(const char *path, Metrics *m) {
     LogFormat fmt = FORMAT_UNKNOWN;
     ssize_t bytes_read;
 
+    // Nota: O read aqui continua a ser read porque estamos a ler texto de um ficheiro até ao fim, o que é seguro.
     while ((bytes_read = read(fd, buf, sizeof(buf))) > 0) {
         for (ssize_t i = 0; i < bytes_read; i++) {
             char c = buf[i];
@@ -95,11 +96,12 @@ void run_worker_pipe(char **ficheiros, int inicio, int fim, int pipe_fd_write, i
     result.count_5xx = m.count_5xx;
     get_top_ip(&m, result.top_ip);
 
-    ssize_t written = write(pipe_fd_write, &result, sizeof(result));
+    // AQUI: write alterado para writen
+    ssize_t written = writen(pipe_fd_write, &result, sizeof(result));
     if (written < 0) {
-        perror("Erro no write do worker");
+        perror("Erro no writen do worker");
     } else if (written != sizeof(result)) {
-        fprintf(stderr, "Erro: write incompleto (%zd de %zu bytes)\n", written, sizeof(result));
+        fprintf(stderr, "Erro: writen incompleto (%zd de %zu bytes)\n", written, sizeof(result));
     }
 
     close(pipe_fd_write);

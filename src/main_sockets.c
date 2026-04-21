@@ -91,40 +91,48 @@ typedef struct {
 
 /* Função auxiliar para gerar o relatório no terminal e/ou ficheiro */
 void gerar_relatorio(WorkerResult total, char *modo, char *output_file) {
-    FILE *out = stdout; // Por defeito escreve no terminal
-    FILE *f = NULL;
+    int fd_out = STDOUT_FILENO;
+    int fd_file = -1;
 
     if (output_file != NULL) {
-        f = fopen(output_file, "w");
-        if (f) {
-            out = f;
+        fd_file = open(output_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd_file >= 0) {
+            fd_out = fd_file;
             printf("\n[INFO] A gravar relatorio no ficheiro: %s\n", output_file);
         } else {
             perror("Erro ao criar ficheiro de output");
         }
     }
 
-    fprintf(out, "\n=== RELATORIO FINAL (%s) ===\n", modo);
-    fprintf(out, "Total de linhas : %ld\n", total.total_lines);
+    char buffer[4096];
+    int len = 0;
+
+    len += snprintf(buffer + len, sizeof(buffer) - len, "\n=== RELATORIO FINAL (%s) ===\n", modo);
+    len += snprintf(buffer + len, sizeof(buffer) - len, "Total de linhas : %ld\n", total.total_lines);
 
     if (strcmp(modo, "security") == 0 || strcmp(modo, "full") == 0) {
-        fprintf(out, "\n--- ALERTAS DE SEGURANCA ---\n");
-        fprintf(out, "WARNINGS        : %ld\n", total.count_warn);
-        fprintf(out, "ERRORS          : %ld\n", total.count_error);
-        fprintf(out, "CRITICAL        : %ld\n", total.count_critical);
-        fprintf(out, "HTTP 4xx/5xx    : %ld\n", total.count_4xx + total.count_5xx);
+        len += snprintf(buffer + len, sizeof(buffer) - len, "\n--- ALERTAS DE SEGURANCA ---\n");
+        len += snprintf(buffer + len, sizeof(buffer) - len, "WARNINGS        : %ld\n", total.count_warn);
+        len += snprintf(buffer + len, sizeof(buffer) - len, "ERRORS          : %ld\n", total.count_error);
+        len += snprintf(buffer + len, sizeof(buffer) - len, "CRITICAL        : %ld\n", total.count_critical);
+        len += snprintf(buffer + len, sizeof(buffer) - len, "HTTP 4xx/5xx    : %ld\n", total.count_4xx + total.count_5xx);
     }
     
     if (strcmp(modo, "traffic") == 0 || strcmp(modo, "full") == 0) {
-        fprintf(out, "\n--- ESTATISTICAS DE TRAFEGO ---\n");
-        fprintf(out, "INFO            : %ld\n", total.count_info);
-        fprintf(out, "DEBUG           : %ld\n", total.count_debug);
-        fprintf(out, "IP Mais Frequente: %s\n", total.top_ip[0] != '\0' ? total.top_ip : "N/A");
+        len += snprintf(buffer + len, sizeof(buffer) - len, "\n--- ESTATISTICAS DE TRAFEGO ---\n");
+        len += snprintf(buffer + len, sizeof(buffer) - len, "INFO            : %ld\n", total.count_info);
+        len += snprintf(buffer + len, sizeof(buffer) - len, "DEBUG           : %ld\n", total.count_debug);
+        len += snprintf(buffer + len, sizeof(buffer) - len, "IP Mais Frequente: %s\n", total.top_ip[0] != '\0' ? total.top_ip : "N/A");
     }
 
-    fprintf(out, "=================================\n");
+    len += snprintf(buffer + len, sizeof(buffer) - len, "=================================\n");
 
-    if (f) fclose(f);
+    // Como os sockets já têm o ipc.h incluído, podemos usar a vossa função de escrita segura!
+    if (writen(fd_out, buffer, len) < 0) {
+        perror("Erro ao escrever relatorio");
+    }
+
+    if (fd_file >= 0) close(fd_file);
 }
 
 int main(int argc, char *argv[]) {
