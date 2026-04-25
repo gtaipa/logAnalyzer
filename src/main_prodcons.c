@@ -86,6 +86,11 @@ int main(int argc, char *argv[]) {
         else if (strncmp(argv[i], "--output=", 9) == 0) output_file = argv[i] + 9;
     }
 
+    if (parser_set_mode_from_string(modo) != 0) {
+        fprintf(stderr, "Modo invalido: %s (use security|performance|traffic|full)\n", modo);
+        exit(1);
+    }
+
     int capacidade = 10, total_ficheiros = 0;
     char **ficheiros = malloc(capacidade * sizeof(char *));
     DIR *dir = opendir(diretorio);

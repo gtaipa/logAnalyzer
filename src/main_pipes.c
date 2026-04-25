@@ -7,6 +7,7 @@
 #include <fcntl.h>
 
 #include "ipc.h"
+#include "parser.h"
 
 void run_worker_pipe(char **ficheiros, int inicio, int fim, int pipe_fd_write, int verbose);
 
@@ -29,6 +30,11 @@ int main(int argc, char *argv[]) {
     printf("Processos: %d\n", num_processos);
     printf("Modo: %s\n", modo);
     printf("Verbose: %s\n", verbose ? "sim" : "nao");
+
+    if (parser_set_mode_from_string(modo) != 0) {
+        fprintf(stderr, "Modo invalido: %s (use security|performance|traffic|full)\n", modo);
+        return 1;
+    }
 
     int capacidade = 10, total_ficheiros = 0;
     char **ficheiros = malloc(capacidade * sizeof(char *));

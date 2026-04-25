@@ -17,6 +17,7 @@ static long   g_lines_total[MAX_THREADS];
 static int    g_num_workers  = 0;
 static time_t g_start_time   = 0;
 static volatile int g_all_done = 0; // Flag para parar a thread monitora
+static int    g_dashboard_enabled = 0;
 
 /* Função que desenha a interface (idêntica aos sockets) */
 static void draw_dashboard(void) {
@@ -118,6 +119,10 @@ void gerar_relatorio_threads(Metrics *total, char *modo, char *output_file) {
 }
 
 int main(int argc, char *argv[]) {
+    /* Dashboard usa ANSI + printf; sem TTY alguns runners deixam stdout fully-buffered. */
+    setvbuf(stdout, NULL, _IONBF, 0);
+    g_dashboard_enabled = isatty(STDOUT_FILENO);
+
     if (argc < 4) {
         printf("Uso: %s <diretorio> <num_threads> <modo> [--verbose] [--output=ficheiro.txt]\n", argv[0]);
         exit(1);
@@ -133,6 +138,11 @@ int main(int argc, char *argv[]) {
     for (int i = 4; i < argc; i++) {
         if (strcmp(argv[i], "--verbose") == 0) verbose = 1;
         else if (strncmp(argv[i], "--output=", 9) == 0) output_file = argv[i] + 9;
+    }
+
+    if (parser_set_mode_from_string(modo) != 0) {
+        fprintf(stderr, "Modo invalido: %s (use security|performance|traffic|full)\n", modo);
+        exit(1);
     }
 
     int capacidade = 10, total_ficheiros = 0;
@@ -179,11 +189,13 @@ int main(int argc, char *argv[]) {
     memset(g_lines_total, 0, sizeof(g_lines_total));
     g_all_done = 0;
 
-    // Imprime linhas em branco suficientes para o dashboard não sobrescrever prints anteriores
-    for (int i = 0; i < g_num_workers + 7; i++) printf("\n");
+    if (g_dashboard_enabled) {
+        // Imprime linhas em branco suficientes para o dashboard não sobrescrever prints anteriores
+        for (int i = 0; i < g_num_workers + 7; i++) printf("\n");
 
-    /* 1. Lançar a Thread Monitora */
-    pthread_create(&monitor_thread, NULL, run_monitor_thread, NULL);
+        /* 1. Lançar a Thread Monitora */
+        pthread_create(&monitor_thread, NULL, run_monitor_thread, NULL);
+    }
 
     /* 2. Lançar as Worker Threads */
     for (int i = 0; i < num_threads; i++) {
@@ -208,9 +220,11 @@ int main(int argc, char *argv[]) {
         pthread_join(threads[i], NULL);
     }
 
-    /* 4. Trabalhadores acabaram! Avisar a Monitora e esperar por ela */
-    g_all_done = 1; 
-    pthread_join(monitor_thread, NULL);
+    if (g_dashboard_enabled) {
+        /* 4. Trabalhadores acabaram! Avisar a Monitora e esperar por ela */
+        g_all_done = 1;
+        pthread_join(monitor_thread, NULL);
+    }
 
     /* 5. Destruir o trinco e gerar relatório */
     pthread_mutex_destroy(&metrics_mutex);
