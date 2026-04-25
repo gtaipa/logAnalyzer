@@ -30,7 +30,7 @@ static void process_file_thread(const char *path, Metrics *local_m, int verbose,
     int fd = open(path, O_RDONLY);
     if (fd < 0) { perror("open"); return; }
 
-    if (verbose) printf("[Thread %d] A abrir: %s\n", worker_index, path);
+    if (verbose) fprintf(stderr, "[Thread %d] A abrir: %s\n", worker_index, path);
 
     char buf[BUF_SIZE];
     char line[LINE_MAX];

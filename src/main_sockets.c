@@ -13,6 +13,7 @@
 
 #include "worker.h"
 #include "ipc.h"
+#include "parser.h"
 
 #define MAX_WORKERS 64
 
@@ -25,6 +26,7 @@ static struct {
 static int    g_num_workers  = 0;
 static time_t g_start_time   = 0;
 static long   g_total_errors = 0;
+static int    g_dashboard_enabled = 0;
 
 static void draw_dashboard(void) {
     int linhas = g_num_workers + 5;
@@ -78,6 +80,7 @@ static void draw_dashboard(void) {
 
 static void sigalrm_handler(int sig) {
     (void)sig;
+    if (!g_dashboard_enabled) return;
     draw_dashboard();
     alarm(1);
 }
@@ -136,6 +139,10 @@ void gerar_relatorio(WorkerResult total, char *modo, char *output_file) {
 }
 
 int main(int argc, char *argv[]) {
+    /* Dashboard usa ANSI + printf; sem TTY alguns runners deixam stdout fully-buffered. */
+    setvbuf(stdout, NULL, _IONBF, 0);
+    g_dashboard_enabled = isatty(STDOUT_FILENO);
+
     if (argc < 4) {
         printf("Uso: %s <diretorio> <num_processos> <modo> [--verbose] [--output=ficheiro.txt]\n", argv[0]);
         exit(1);
@@ -155,6 +162,11 @@ int main(int argc, char *argv[]) {
         } else if (strncmp(argv[i], "--output=", 9) == 0) {
             output_file = argv[i] + 9; // Guarda o nome do ficheiro (tudo a seguir ao "=")
         }
+    }
+
+    if (parser_set_mode_from_string(modo) != 0) {
+        fprintf(stderr, "Modo invalido: %s (use security|performance|traffic|full)\n", modo);
+        exit(1);
     }
 
     int capacidade = 10, total_ficheiros = 0;
@@ -209,10 +221,11 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    for (int i = 0; i < g_num_workers + 5; i++) printf("\n");
-
-    signal(SIGALRM, sigalrm_handler);
-    alarm(1);
+    if (g_dashboard_enabled) {
+        for (int i = 0; i < g_num_workers + 5; i++) printf("\n");
+        signal(SIGALRM, sigalrm_handler);
+        alarm(1);
+    }
 
     WorkerResult total = {0};
     int workers_done = 0;
@@ -289,8 +302,10 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    alarm(0); 
-    draw_dashboard();
+    if (g_dashboard_enabled) {
+        alarm(0);
+        draw_dashboard();
+    }
 
     close(server_fd);
     unlink(SOCKET_PATH);

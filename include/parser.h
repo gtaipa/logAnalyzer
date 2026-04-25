@@ -96,4 +96,13 @@ void init_metrics(Metrics *m);
  */
 LogLevel level_from_string(const char *s);
 
+/**
+ * Define o modo de analise a partir do argumento CLI ("security", "performance",
+ * "traffic", "full"). Retorna 0 em sucesso, -1 se a string for invalida.
+ *
+ * O modo afeta o parse_line(): eventos que nao correspondem ao modo sao
+ * ignorados (parse_line retorna -1).
+ */
+int parser_set_mode_from_string(const char *mode_str);
+
 #endif /* PARSER_H */

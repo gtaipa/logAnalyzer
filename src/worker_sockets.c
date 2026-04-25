@@ -50,7 +50,7 @@ static void process_file(const char *path, Metrics *m, int verbose,
     int fd = open(path, O_RDONLY);
     if (fd < 0) { perror("open"); return; }
 
-    if (verbose) printf("[Filho %d] A abrir: %s\n", getpid(), path);
+    if (verbose) fprintf(stderr, "[Filho %d] A abrir: %s\n", getpid(), path);
 
     char buf[BUF_SIZE];
     char line[LINE_MAX];
