@@ -10,8 +10,6 @@
 #include "worker_prodcons.h"
 #include "parser.h"
 
-int produtores_ativos = 1;
-
 void gerar_relatorio_prodcons(Metrics *total, char *modo, char *output_file) {
     int fd_out = STDOUT_FILENO; 
     int fd_file = -1;
@@ -27,7 +25,7 @@ void gerar_relatorio_prodcons(Metrics *total, char *modo, char *output_file) {
         }
     }
 
-    char buffer[4096];
+    char buffer[4096]; 
     int len = 0;
 
     // Constrói a string no buffer na memória
@@ -67,7 +65,7 @@ void gerar_relatorio_prodcons(Metrics *total, char *modo, char *output_file) {
 }
 
 int main(int argc, char *argv[]) {
-    if (argc < 4) {
+    if (argc < 5) {
         printf("Uso: %s <diretorio> <num_produtores> <num_consumidores> <modo> [--verbose] [--output=ficheiro.txt]\n",
                argv[0]);
         exit(1);
@@ -77,6 +75,13 @@ int main(int argc, char *argv[]) {
     int num_produtores   = atoi(argv[2]);
     int num_consumidores = atoi(argv[3]);
     char *modo           = argv[4];
+
+    if (num_produtores < 1 || num_consumidores < 1) {
+        fprintf(stderr, "Erro: num_produtores e num_consumidores tem de ser >= 1.\n");
+        fprintf(stderr, "Uso: %s <diretorio> <num_produtores> <num_consumidores> <modo> [--verbose] [--output=ficheiro.txt]\n",
+                argv[0]);
+        exit(1);
+    }
 
     int verbose = 0;
     char *output_file = NULL;
@@ -144,7 +149,7 @@ int main(int argc, char *argv[]) {
     printf("[MAIN] A lançar %d threads produtoras...\n", num_produtores);
 
     int ficheiros_por_produtor = total_ficheiros / num_produtores;
-    produtores_ativos = 1;
+    buffer.produtores_ativos = 1;
 
     for (int i = 0; i < num_produtores; i++) {
         prod_args[i].ficheiros = ficheiros;
@@ -191,8 +196,8 @@ int main(int argc, char *argv[]) {
     printf("[MAIN] Todos os produtores terminaram!\n");
 
     pthread_mutex_lock(&buffer.mutex);
-    produtores_ativos = 0;
-    pthread_cond_broadcast(&buffer.cond_not_empty);
+    buffer.produtores_ativos = 0;
+    pthread_cond_broadcast(&buffer.cond_dados_disponiveis);
     pthread_mutex_unlock(&buffer.mutex);
 
     printf("[MAIN] Sinalizou aos consumidores: fim de turno dos produtores!\n");

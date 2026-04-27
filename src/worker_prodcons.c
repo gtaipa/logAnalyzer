@@ -15,16 +15,17 @@ void init_bounded_buffer(BoundedBuffer *buffer) {
     buffer->in = 0;
     buffer->out = 0;
     buffer->count = 0;
+    buffer->produtores_ativos = 1;
     
     pthread_mutex_init(&buffer->mutex, NULL);
-    pthread_cond_init(&buffer->cond_not_full, NULL);
-    pthread_cond_init(&buffer->cond_not_empty, NULL);
+    pthread_cond_init(&buffer->cond_espaco_disponivel, NULL);
+    pthread_cond_init(&buffer->cond_dados_disponiveis, NULL);
 }
 
 void destroy_bounded_buffer(BoundedBuffer *buffer) {
     pthread_mutex_destroy(&buffer->mutex);
-    pthread_cond_destroy(&buffer->cond_not_full);
-    pthread_cond_destroy(&buffer->cond_not_empty);
+    pthread_cond_destroy(&buffer->cond_espaco_disponivel);
+    pthread_cond_destroy(&buffer->cond_dados_disponiveis);
 }
 
 static void process_file_prodcons(
@@ -62,20 +63,14 @@ static void process_file_prodcons(
                     pthread_mutex_lock(&buffer->mutex);
                     
                     while (buffer->count == BUFFER_SIZE) {
-                        if (verbose)
-                            printf("[Produtor %d] Buffer cheio! Esperando...\n", worker_index);
-                        pthread_cond_wait(&buffer->cond_not_full, &buffer->mutex);
+                        pthread_cond_wait(&buffer->cond_espaco_disponivel, &buffer->mutex);
                     }
                     
                     buffer->buffer[buffer->in] = entry;
                     buffer->in = (buffer->in + 1) % BUFFER_SIZE;
                     buffer->count++;
-                    
-                    if (verbose && buffer->count == 1)
-                        printf("[Produtor %d] Inseriu primeira entrada. Count=%d\n",
-                               worker_index, buffer->count);
-                    
-                    pthread_cond_signal(&buffer->cond_not_empty);
+
+                    pthread_cond_signal(&buffer->cond_dados_disponiveis);
                     
                     pthread_mutex_unlock(&buffer->mutex);
                 }
@@ -97,14 +92,14 @@ static void process_file_prodcons(
             pthread_mutex_lock(&buffer->mutex);
             
             while (buffer->count == BUFFER_SIZE) {
-                pthread_cond_wait(&buffer->cond_not_full, &buffer->mutex);
+                pthread_cond_wait(&buffer->cond_espaco_disponivel, &buffer->mutex);
             }
             
             buffer->buffer[buffer->in] = entry;
             buffer->in = (buffer->in + 1) % BUFFER_SIZE;
             buffer->count++;
             
-            pthread_cond_signal(&buffer->cond_not_empty);
+            pthread_cond_signal(&buffer->cond_dados_disponiveis);
             pthread_mutex_unlock(&buffer->mutex);
         }
     }
@@ -154,13 +149,11 @@ void *run_consumer(void *arg) {
 
         pthread_mutex_lock(&buffer->mutex);
 
-        while (buffer->count == 0 && produtores_ativos) {
-            if (verbose && worker_index == 1)
-                printf("[Consumidores] A aguardar dados do buffer...\n");
-            pthread_cond_wait(&buffer->cond_not_empty, &buffer->mutex);
+        while (buffer->count == 0 && buffer->produtores_ativos) {
+            pthread_cond_wait(&buffer->cond_dados_disponiveis, &buffer->mutex);
         }
 
-        if (buffer->count == 0 && !produtores_ativos) {
+        if (buffer->count == 0 && !buffer->produtores_ativos) {
             pthread_mutex_unlock(&buffer->mutex);
             if (verbose)
                 printf("[Consumidor %d] Sem mais dados. A terminar.\n", worker_index);
@@ -171,11 +164,7 @@ void *run_consumer(void *arg) {
         buffer->out = (buffer->out + 1) % BUFFER_SIZE;
         buffer->count--;
 
-        if (verbose && buffer->count == BUFFER_SIZE - 1)
-            printf("[Consumidor %d] Buffer agora tem espaço. Count=%d\n",
-                   worker_index, buffer->count);
-
-        pthread_cond_signal(&buffer->cond_not_full);
+        pthread_cond_signal(&buffer->cond_espaco_disponivel);
 
         pthread_mutex_unlock(&buffer->mutex);
 
