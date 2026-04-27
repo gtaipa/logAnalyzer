@@ -7,18 +7,17 @@
 /* Tamanho do buffer circular (conforme o resumo do colega) */
 #define BUFFER_SIZE 100
 
-/* =========================================================
- * 📦 O Armazém (Bounded Buffer) - A passadeira rolante
- * ========================================================= */
 typedef struct {
     LogEntry buffer[BUFFER_SIZE];    // Array circular para as linhas de log
     int in;                          // Índice para inserção (Produtor)
     int out;                         // Índice para remoção (Consumidor)
     int count;                       // Quantidade de items no buffer neste momento
 
+    int produtores_ativos;           // Flag de terminação (1 enquanto há produtores)
+
     pthread_mutex_t mutex;           // Cadeado exclusivo
-    pthread_cond_t cond_not_full;    // Sinal: buffer não está cheio
-    pthread_cond_t cond_not_empty;   // Sinal: buffer não está vazio
+    pthread_cond_t cond_espaco_disponivel;  // Produtor espera: buffer não cheio
+    pthread_cond_t cond_dados_disponiveis;  // Consumidor espera: buffer não vazio
 } BoundedBuffer;
 
 /* =========================================================
@@ -35,12 +34,6 @@ typedef struct {
     Metrics *global_metrics;         // Apontador para a variável global de resultados (para o Consumidor)
     pthread_mutex_t *metrics_mutex;  // Apontador para o cadeado das métricas globais
 } ProducerConsumerArgs;
-
-/* =========================================================
- * Variáveis Globais Partilhadas
- * ========================================================= */
-/* Alarme de fim de turno (declarado no main_prodcons.c) */
-extern int produtores_ativos;
 
 /* =========================================================
  * Protótipos das funções

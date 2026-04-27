@@ -77,7 +77,7 @@ static void draw_dashboard(void) {
     printf("║ Elapsed: %02d:%02d:%02d | Errors: %-6ld      ║\n", hh, mm, ss, g_total_errors);
     printf("╚══════════════════════════════════════════╝\n");
 }
-
+// esta funçao desenha o dashboard
 static void sigalrm_handler(int sig) {
     (void)sig;
     if (!g_dashboard_enabled) return;
@@ -197,14 +197,14 @@ int main(int argc, char *argv[]) {
         printf("Nenhum ficheiro .log encontrado.\n");
         exit(0);
     }
-    if (num_processos > total_ficheiros) num_processos = total_ficheiros;
+    if (num_processos > total_ficheiros) num_processos = total_ficheiros; // se o número de processos for maior que o número de ficheiros, define o número de processos como o número de ficheiros para nao desperdiçar recursos desnecessariamente
 
-    int server_fd = create_server_socket();
-    if (server_fd < 0) exit(1);
+    int server_fd = create_server_socket(); // Cria o socket do servidor para comunicação com os workers
+    if (server_fd < 0) exit(1); // se der erro encerra o programa
 
-    g_num_workers = num_processos;
-    g_start_time  = time(NULL);
-    memset(worker_status, 0, sizeof(worker_status));
+    g_num_workers = num_processos; // número de workers , g_num_workers = variavel global para armazenar o número de workers
+    g_start_time  = time(NULL); // tempo inicial
+    memset(worker_status, 0, sizeof(worker_status)); // zera o status dos workers
 
     int ficheiros_por_processo = total_ficheiros / num_processos;
 
