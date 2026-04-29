@@ -3,12 +3,42 @@
 #include <string.h>
 #include <dirent.h>
 #include <pthread.h>
+#include <semaphore.h>
 #include <unistd.h>
 #include <time.h>
 #include <fcntl.h>
 
 #include "worker_prodcons.h"
 #include "parser.h"
+
+#define MAX_FICHEIROS 100
+#define MAX_CAMINHO 256
+#define MAX_PRODUTORES 64
+#define MAX_CONSUMIDORES 64
+
+static char ficheiros_storage[MAX_FICHEIROS][MAX_CAMINHO];
+char *ficheiros[MAX_FICHEIROS];
+int total_ficheiros = 0;
+int num_produtores = 0;
+int verbose = 0;
+
+LogEntry buffer[BUFFER_SIZE];
+int prodptr = 0;
+int consptr = 0;
+int buffer_count = 0;
+int produtores_ativos = 1;
+
+Metrics global_metrics;
+pthread_mutex_t trinco;
+pthread_mutex_t metrics_mutex;
+sem_t vagas;
+sem_t itens;
+
+static pthread_t producer_threads[MAX_PRODUTORES];
+static pthread_t consumer_threads[MAX_CONSUMIDORES];
+static pthread_t alert_thread;
+static int producer_ids[MAX_PRODUTORES];
+static int consumer_ids[MAX_CONSUMIDORES];
 
 void gerar_relatorio_prodcons(Metrics *total, char *modo, char *output_file) {
     int fd_out = STDOUT_FILENO; 
@@ -25,39 +55,39 @@ void gerar_relatorio_prodcons(Metrics *total, char *modo, char *output_file) {
         }
     }
 
-    char buffer[4096]; 
+    char report_buffer[4096]; 
     int len = 0;
 
     // Constrói a string no buffer na memória
-    len += snprintf(buffer + len, sizeof(buffer) - len, "\n=== RELATORIO FINAL PRODUTOR-CONSUMIDOR (%s) ===\n", modo);
-    len += snprintf(buffer + len, sizeof(buffer) - len, "Total de linhas : %ld\n", total->total_lines);
+    len += snprintf(report_buffer + len, sizeof(report_buffer) - len, "\n=== RELATORIO FINAL PRODUTOR-CONSUMIDOR (%s) ===\n", modo);
+    len += snprintf(report_buffer + len, sizeof(report_buffer) - len, "Total de linhas : %ld\n", total->total_lines);
 
     if (strcmp(modo, "security") == 0 || strcmp(modo, "full") == 0) {
-        len += snprintf(buffer + len, sizeof(buffer) - len, "\n--- ALERTAS DE SEGURANCA ---\n");
-        len += snprintf(buffer + len, sizeof(buffer) - len, "DEBUG           : %ld\n", total->count_debug);
-        len += snprintf(buffer + len, sizeof(buffer) - len, "INFO            : %ld\n", total->count_info);
-        len += snprintf(buffer + len, sizeof(buffer) - len, "WARNINGS        : %ld\n", total->count_warn);
-        len += snprintf(buffer + len, sizeof(buffer) - len, "ERRORS          : %ld\n", total->count_error);
-        len += snprintf(buffer + len, sizeof(buffer) - len, "CRITICAL        : %ld\n", total->count_critical);
+        len += snprintf(report_buffer + len, sizeof(report_buffer) - len, "\n--- ALERTAS DE SEGURANCA ---\n");
+        len += snprintf(report_buffer + len, sizeof(report_buffer) - len, "DEBUG           : %ld\n", total->count_debug);
+        len += snprintf(report_buffer + len, sizeof(report_buffer) - len, "INFO            : %ld\n", total->count_info);
+        len += snprintf(report_buffer + len, sizeof(report_buffer) - len, "WARNINGS        : %ld\n", total->count_warn);
+        len += snprintf(report_buffer + len, sizeof(report_buffer) - len, "ERRORS          : %ld\n", total->count_error);
+        len += snprintf(report_buffer + len, sizeof(report_buffer) - len, "CRITICAL        : %ld\n", total->count_critical);
     }
     
     if (strcmp(modo, "traffic") == 0 || strcmp(modo, "full") == 0) {
-        len += snprintf(buffer + len, sizeof(buffer) - len, "\n--- ESTATISTICAS DE TRAFEGO ---\n");
-        len += snprintf(buffer + len, sizeof(buffer) - len, "HTTP 4xx        : %ld\n", total->count_4xx);
-        len += snprintf(buffer + len, sizeof(buffer) - len, "HTTP 5xx        : %ld\n", total->count_5xx);
+        len += snprintf(report_buffer + len, sizeof(report_buffer) - len, "\n--- ESTATISTICAS DE TRAFEGO ---\n");
+        len += snprintf(report_buffer + len, sizeof(report_buffer) - len, "HTTP 4xx        : %ld\n", total->count_4xx);
+        len += snprintf(report_buffer + len, sizeof(report_buffer) - len, "HTTP 5xx        : %ld\n", total->count_5xx);
     }
 
     if (strcmp(modo, "full") == 0) {
-        len += snprintf(buffer + len, sizeof(buffer) - len, "\n--- TOP IPs ---\n");
+        len += snprintf(report_buffer + len, sizeof(report_buffer) - len, "\n--- TOP IPs ---\n");
         for (int i = 0; i < total->ip_num && i < 10; i++) {
-            len += snprintf(buffer + len, sizeof(buffer) - len, "%s : %ld accesos\n", total->ip_list[i], total->ip_count[i]);
+            len += snprintf(report_buffer + len, sizeof(report_buffer) - len, "%s : %ld accesos\n", total->ip_list[i], total->ip_count[i]);
         }
     }
 
-    len += snprintf(buffer + len, sizeof(buffer) - len, "================================================\n");
+    len += snprintf(report_buffer + len, sizeof(report_buffer) - len, "================================================\n");
 
     // Faz um único write com todo o conteúdo!
-    if (write(fd_out, buffer, len) < 0) {
+    if (write(fd_out, report_buffer, len) < 0) {
         perror("Erro ao escrever relatorio");
     }
 
@@ -72,7 +102,7 @@ int main(int argc, char *argv[]) {
     }
 
     char *diretorio      = argv[1];
-    int num_produtores   = atoi(argv[2]);
+    num_produtores       = atoi(argv[2]);
     int num_consumidores = atoi(argv[3]);
     char *modo           = argv[4];
 
@@ -83,7 +113,7 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
-    int verbose = 0;
+    verbose = 0;
     char *output_file = NULL;
 
     for (int i = 5; i < argc; i++) {
@@ -96,8 +126,17 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
-    int capacidade = 10, total_ficheiros = 0;
-    char **ficheiros = malloc(capacidade * sizeof(char *));
+    if (num_produtores > MAX_PRODUTORES) {
+        printf("[MAIN] Numero de produtores ajustado para %d (limite fixo).\n", MAX_PRODUTORES);
+        num_produtores = MAX_PRODUTORES;
+    }
+
+    if (num_consumidores > MAX_CONSUMIDORES) {
+        printf("[MAIN] Numero de consumidores ajustado para %d (limite fixo).\n", MAX_CONSUMIDORES);
+        num_consumidores = MAX_CONSUMIDORES;
+    }
+
+    total_ficheiros = 0;
     DIR *dir = opendir(diretorio);
     if (!dir) {
         perror("opendir");
@@ -108,20 +147,32 @@ int main(int argc, char *argv[]) {
     while ((entrada = readdir(dir)) != NULL) {
         int len = strlen(entrada->d_name);
         if (len > 4 && strcmp(entrada->d_name + len - 4, ".log") == 0) {
-            if (total_ficheiros == capacidade) {
-                capacidade *= 2;
-                ficheiros = realloc(ficheiros, capacidade * sizeof(char *));
+            if (total_ficheiros == MAX_FICHEIROS) {
+                fprintf(stderr, "[WARN] Limite de %d ficheiros atingido; restantes .log ignorados.\n", MAX_FICHEIROS);
+                break;
             }
-            char caminho[512];
-            snprintf(caminho, sizeof(caminho), "%s/%s", diretorio, entrada->d_name);
-            ficheiros[total_ficheiros++] = strdup(caminho);
+
+            int n = snprintf(
+                ficheiros_storage[total_ficheiros],
+                sizeof(ficheiros_storage[total_ficheiros]),
+                "%s/%s",
+                diretorio,
+                entrada->d_name
+            );
+
+            if (n < 0 || n >= (int)sizeof(ficheiros_storage[total_ficheiros])) {
+                fprintf(stderr, "[WARN] Caminho demasiado longo, ignorado: %s/%s\n", diretorio, entrada->d_name);
+                continue;
+            }
+
+            ficheiros[total_ficheiros] = ficheiros_storage[total_ficheiros];
+            total_ficheiros++;
         }
     }
     closedir(dir);
 
     if (total_ficheiros == 0) {
         printf("Nenhum ficheiro .log encontrado em %s.\n", diretorio);
-        free(ficheiros);
         exit(0);
     }
 
@@ -131,39 +182,26 @@ int main(int argc, char *argv[]) {
     printf("[MAIN] A usar %d produtores e %d consumidores.\n",
            num_produtores, num_consumidores);
 
-    BoundedBuffer buffer;
-    init_bounded_buffer(&buffer);
+    init_bounded_buffer();
+    init_alert_buffer();
 
-    Metrics global_metrics;
     init_metrics(&global_metrics);
+
+    if (pthread_create(&alert_thread, NULL, run_alert_monitor, NULL) != 0) {
+        perror("Erro ao criar thread de alertas");
+        destroy_alert_buffer();
+        destroy_bounded_buffer();
+        exit(1);
+    }
     
-    pthread_mutex_t metrics_mutex;
-    pthread_mutex_init(&metrics_mutex, NULL);
-
-    pthread_t *producer_threads = malloc(num_produtores * sizeof(pthread_t));
-    pthread_t *consumer_threads = malloc(num_consumidores * sizeof(pthread_t));
-
-    ProducerConsumerArgs *prod_args = malloc(num_produtores * sizeof(ProducerConsumerArgs));
-    ProducerConsumerArgs *cons_args = malloc(num_consumidores * sizeof(ProducerConsumerArgs));
-
     printf("[MAIN] A lançar %d threads produtoras...\n", num_produtores);
 
-    int ficheiros_por_produtor = total_ficheiros / num_produtores;
-    buffer.produtores_ativos = 1;
+    produtores_ativos = 1;
 
     for (int i = 0; i < num_produtores; i++) {
-        prod_args[i].ficheiros = ficheiros;
-        prod_args[i].inicio = i * ficheiros_por_produtor;
-        prod_args[i].fim = (i == num_produtores - 1)
-            ? total_ficheiros
-            : prod_args[i].inicio + ficheiros_por_produtor;
-        prod_args[i].worker_index = i + 1;
-        prod_args[i].verbose = verbose;
-        prod_args[i].buffer = &buffer;
-        prod_args[i].global_metrics = NULL;
-        prod_args[i].metrics_mutex = NULL;
+        producer_ids[i] = i + 1;
 
-        if (pthread_create(&producer_threads[i], NULL, run_producer, &prod_args[i]) != 0) {
+        if (pthread_create(&producer_threads[i], NULL, run_producer, &producer_ids[i]) != 0) {
             perror("Erro ao criar thread produtora");
             exit(1);
         }
@@ -172,16 +210,9 @@ int main(int argc, char *argv[]) {
     printf("[MAIN] A lançar %d threads consumidoras...\n", num_consumidores);
 
     for (int i = 0; i < num_consumidores; i++) {
-        cons_args[i].ficheiros = NULL;
-        cons_args[i].inicio = 0;
-        cons_args[i].fim = 0;
-        cons_args[i].worker_index = i + 1;
-        cons_args[i].verbose = verbose;
-        cons_args[i].buffer = &buffer;
-        cons_args[i].global_metrics = &global_metrics;
-        cons_args[i].metrics_mutex = &metrics_mutex;
+        consumer_ids[i] = i + 1;
 
-        if (pthread_create(&consumer_threads[i], NULL, run_consumer, &cons_args[i]) != 0) {
+        if (pthread_create(&consumer_threads[i], NULL, run_consumer, &consumer_ids[i]) != 0) {
             perror("Erro ao criar thread consumidora");
             exit(1);
         }
@@ -195,10 +226,13 @@ int main(int argc, char *argv[]) {
 
     printf("[MAIN] Todos os produtores terminaram!\n");
 
-    pthread_mutex_lock(&buffer.mutex);
-    buffer.produtores_ativos = 0;
-    pthread_cond_broadcast(&buffer.cond_dados_disponiveis);
-    pthread_mutex_unlock(&buffer.mutex);
+    pthread_mutex_lock(&trinco);
+    produtores_ativos = 0;
+    pthread_mutex_unlock(&trinco);
+
+    for (int i = 0; i < num_consumidores; i++) {
+        sem_post(&itens);
+    }
 
     printf("[MAIN] Sinalizou aos consumidores: fim de turno dos produtores!\n");
 
@@ -210,17 +244,17 @@ int main(int argc, char *argv[]) {
 
     printf("[MAIN] Todos os consumidores terminaram!\n");
 
-    pthread_mutex_destroy(&metrics_mutex);
-    destroy_bounded_buffer(&buffer);
+    pthread_mutex_lock(&alert_trinco);
+    consumidores_ativos = 0;
+    pthread_mutex_unlock(&alert_trinco);
+    sem_post(&alert_itens);
+
+    pthread_join(alert_thread, NULL);
+
+    destroy_alert_buffer();
+    destroy_bounded_buffer();
 
     gerar_relatorio_prodcons(&global_metrics, modo, output_file);
-
-    for (int i = 0; i < total_ficheiros; i++) free(ficheiros[i]);
-    free(ficheiros);
-    free(producer_threads);
-    free(consumer_threads);
-    free(prod_args);
-    free(cons_args);
 
     printf("[MAIN] Programa terminou com sucesso!\n");
     return 0;

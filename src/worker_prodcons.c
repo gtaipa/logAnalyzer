@@ -7,33 +7,212 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <semaphore.h>
+#include <errno.h>
+#include <ctype.h>
+#include <time.h>
 
 #define BUF_SIZE 4096
 #define LINE_MAX 512
 
-void init_bounded_buffer(BoundedBuffer *buffer) {
-    buffer->in = 0;
-    buffer->out = 0;
-    buffer->count = 0;
-    buffer->produtores_ativos = 1;
-    
-    pthread_mutex_init(&buffer->mutex, NULL);
-    pthread_cond_init(&buffer->cond_espaco_disponivel, NULL);
-    pthread_cond_init(&buffer->cond_dados_disponiveis, NULL);
+LogEntry alert_buffer[ALERT_BUFFER_SIZE];
+int alert_prodptr = 0;
+int alert_consptr = 0;
+int alert_count = 0;
+pthread_mutex_t alert_trinco;
+sem_t alert_vagas;
+sem_t alert_itens;
+volatile int consumidores_ativos = 1;
+
+static void esperar(sem_t *sem) {
+    while (sem_wait(sem) == -1) {
+        if (errno != EINTR) {
+            perror("sem_wait");
+            pthread_exit(NULL);
+        }
+    }
 }
 
-void destroy_bounded_buffer(BoundedBuffer *buffer) {
-    pthread_mutex_destroy(&buffer->mutex);
-    pthread_cond_destroy(&buffer->cond_espaco_disponivel);
-    pthread_cond_destroy(&buffer->cond_dados_disponiveis);
+static void assinalar(sem_t *sem) {
+    if (sem_post(sem) == -1) {
+        perror("sem_post");
+        pthread_exit(NULL);
+    }
 }
 
-static void process_file_prodcons(
-    const char *path, 
-    BoundedBuffer *buffer,
-    int verbose, 
-    int worker_index
-) {
+void init_bounded_buffer(void) {
+    prodptr = 0;
+    consptr = 0;
+    buffer_count = 0;
+    produtores_ativos = 1;
+
+    pthread_mutex_init(&trinco, NULL);
+    pthread_mutex_init(&metrics_mutex, NULL);
+    sem_init(&vagas, 0, BUFFER_SIZE);
+    sem_init(&itens, 0, 0);
+}
+
+void destroy_bounded_buffer(void) {
+    pthread_mutex_destroy(&trinco);
+    pthread_mutex_destroy(&metrics_mutex);
+    sem_destroy(&vagas);
+    sem_destroy(&itens);
+}
+
+void init_alert_buffer(void) {
+    alert_prodptr = 0;
+    alert_consptr = 0;
+    alert_count = 0;
+    consumidores_ativos = 1;
+
+    pthread_mutex_init(&alert_trinco, NULL);
+    sem_init(&alert_vagas, 0, ALERT_BUFFER_SIZE);
+    sem_init(&alert_itens, 0, 0);
+}
+
+void destroy_alert_buffer(void) {
+    pthread_mutex_destroy(&alert_trinco);
+    sem_destroy(&alert_vagas);
+    sem_destroy(&alert_itens);
+}
+
+static const char *level_to_string(LogLevel level) {
+    switch (level) {
+        case LEVEL_DEBUG: return "DEBUG";
+        case LEVEL_INFO: return "INFO";
+        case LEVEL_WARN: return "WARN";
+        case LEVEL_ERROR: return "ERROR";
+        case LEVEL_CRITICAL: return "CRITICAL";
+        default: return "UNKNOWN";
+    }
+}
+
+static int contains_case_insensitive(const char *text, const char *needle) {
+    size_t needle_len = strlen(needle);
+
+    if (needle_len == 0) return 1;
+
+    for (const char *p = text; *p; p++) {
+        size_t i = 0;
+        while (needle[i] &&
+               p[i] &&
+               tolower((unsigned char)p[i]) == tolower((unsigned char)needle[i])) {
+            i++;
+        }
+        if (i == needle_len) return 1;
+    }
+
+    return 0;
+}
+
+static int is_sql_injection(const LogEntry *entry) {
+    const char *msg = entry->message;
+
+    return contains_case_insensitive(msg, "sql injection") ||
+           contains_case_insensitive(msg, "union select") ||
+           contains_case_insensitive(msg, " or 1=1") ||
+           contains_case_insensitive(msg, "' or ") ||
+           contains_case_insensitive(msg, "\" or ") ||
+           contains_case_insensitive(msg, "drop table") ||
+           contains_case_insensitive(msg, "information_schema");
+}
+
+static int is_security_alert(const LogEntry *entry) {
+    return entry->level == LEVEL_ERROR ||
+           entry->level == LEVEL_CRITICAL ||
+           is_sql_injection(entry);
+}
+
+void send_alert(LogEntry *entry) {
+    if (sem_trywait(&alert_vagas) != 0) {
+        if (errno == EAGAIN) {
+            fprintf(stderr, "[AVISO] Buffer de alertas cheio! Alerta descartado: %s\n",
+                    entry->message);
+            return;
+        }
+
+        perror("sem_trywait");
+        return;
+    }
+
+    pthread_mutex_lock(&alert_trinco);
+    alert_buffer[alert_prodptr] = *entry;
+    alert_prodptr = (alert_prodptr + 1) % ALERT_BUFFER_SIZE;
+    alert_count++;
+    pthread_mutex_unlock(&alert_trinco);
+
+    assinalar(&alert_itens);
+}
+
+void *run_alert_monitor(void *arg) {
+    (void)arg;
+
+    FILE *f_alertas = fopen("alertas_seguranca.txt", "a");
+    if (!f_alertas) {
+        perror("alertas_seguranca.txt");
+        pthread_exit(NULL);
+    }
+
+    while (1) {
+        LogEntry alerta;
+
+        esperar(&alert_itens);
+        pthread_mutex_lock(&alert_trinco);
+
+        if (alert_count == 0 && !consumidores_ativos) {
+            pthread_mutex_unlock(&alert_trinco);
+            break;
+        }
+
+        if (alert_count == 0) {
+            pthread_mutex_unlock(&alert_trinco);
+            continue;
+        }
+
+        alerta = alert_buffer[alert_consptr];
+        alert_consptr = (alert_consptr + 1) % ALERT_BUFFER_SIZE;
+        alert_count--;
+
+        pthread_mutex_unlock(&alert_trinco);
+        assinalar(&alert_vagas);
+
+        time_t agora = time(NULL);
+        struct tm *tm_info = localtime(&agora);
+        char timestamp[26];
+
+        if (tm_info) {
+            strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", tm_info);
+        } else {
+            strncpy(timestamp, "tempo-indisponivel", sizeof(timestamp) - 1);
+            timestamp[sizeof(timestamp) - 1] = '\0';
+        }
+
+        fprintf(f_alertas,
+                "[%s] [%s] IP: %-15s | Evento: %s\n",
+                timestamp,
+                level_to_string(alerta.level),
+                alerta.ip[0] ? alerta.ip : "-",
+                alerta.message);
+        fflush(f_alertas);
+    }
+
+    fclose(f_alertas);
+    pthread_exit(NULL);
+}
+
+static void inserir_no_buffer(LogEntry entry) {
+    esperar(&vagas);
+    pthread_mutex_lock(&trinco);
+
+    buffer[prodptr] = entry;
+    prodptr = (prodptr + 1) % BUFFER_SIZE;
+    buffer_count++;
+
+    pthread_mutex_unlock(&trinco);
+    assinalar(&itens);
+}
+
+static void process_file_prodcons(const char *path, int worker_index) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
         perror("open");
@@ -59,22 +238,9 @@ static void process_file_prodcons(
 
                 LogEntry entry;
                 if (parse_line(line, fmt, &entry) == 0) {
-                    
-                    pthread_mutex_lock(&buffer->mutex);
-                    
-                    while (buffer->count == BUFFER_SIZE) {
-                        pthread_cond_wait(&buffer->cond_espaco_disponivel, &buffer->mutex);
-                    }
-                    
-                    buffer->buffer[buffer->in] = entry;
-                    buffer->in = (buffer->in + 1) % BUFFER_SIZE;
-                    buffer->count++;
-
-                    pthread_cond_signal(&buffer->cond_dados_disponiveis);
-                    
-                    pthread_mutex_unlock(&buffer->mutex);
+                    inserir_no_buffer(entry);
                 }
-                
+
                 line_len = 0;
             } else {
                 if (line_len < LINE_MAX - 1) line[line_len++] = c;
@@ -82,25 +248,13 @@ static void process_file_prodcons(
         }
     }
 
-    /* Processar última linha, se houver */
     if (line_len > 0) {
         line[line_len] = '\0';
         if (fmt == FORMAT_UNKNOWN) fmt = detect_format(line);
-        
+
         LogEntry entry;
         if (parse_line(line, fmt, &entry) == 0) {
-            pthread_mutex_lock(&buffer->mutex);
-            
-            while (buffer->count == BUFFER_SIZE) {
-                pthread_cond_wait(&buffer->cond_espaco_disponivel, &buffer->mutex);
-            }
-            
-            buffer->buffer[buffer->in] = entry;
-            buffer->in = (buffer->in + 1) % BUFFER_SIZE;
-            buffer->count++;
-            
-            pthread_cond_signal(&buffer->cond_dados_disponiveis);
-            pthread_mutex_unlock(&buffer->mutex);
+            inserir_no_buffer(entry);
         }
     }
 
@@ -109,22 +263,19 @@ static void process_file_prodcons(
 }
 
 void *run_producer(void *arg) {
-    ProducerConsumerArgs *pc_args = (ProducerConsumerArgs *)arg;
-    int verbose = pc_args->verbose;
-    int worker_index = pc_args->worker_index;
-    
-    if (verbose)
-        printf("[Produtor %d] A começar a processar ficheiros [%d, %d)\n",
-               worker_index, pc_args->inicio, pc_args->fim);
+    int worker_index = *(int *)arg;
+    int ficheiros_por_produtor = total_ficheiros / num_produtores;
+    int inicio = (worker_index - 1) * ficheiros_por_produtor;
+    int fim = (worker_index == num_produtores)
+        ? total_ficheiros
+        : inicio + ficheiros_por_produtor;
 
-    /* Processar os ficheiros atribuídos a este produtor */
-    for (int i = pc_args->inicio; i < pc_args->fim; i++) {
-        process_file_prodcons(
-            pc_args->ficheiros[i],
-            pc_args->buffer,
-            verbose,
-            worker_index
-        );
+    if (verbose)
+        printf("[Produtor %d] A comecar a processar ficheiros [%d, %d)\n",
+               worker_index, inicio, fim);
+
+    for (int i = inicio; i < fim; i++) {
+        process_file_prodcons(ficheiros[i], worker_index);
     }
 
     if (verbose)
@@ -134,43 +285,38 @@ void *run_producer(void *arg) {
 }
 
 void *run_consumer(void *arg) {
-    ProducerConsumerArgs *pc_args = (ProducerConsumerArgs *)arg;
-    int verbose = pc_args->verbose;
-    int worker_index = pc_args->worker_index;
-    BoundedBuffer *buffer = pc_args->buffer;
-    Metrics *global_metrics = pc_args->global_metrics;
-    pthread_mutex_t *metrics_mutex = pc_args->metrics_mutex;
+    int worker_index = *(int *)arg;
 
     if (verbose)
-        printf("[Consumidor %d] A começar a processar o buffer...\n", worker_index);
+        printf("[Consumidor %d] A comecar a processar o buffer...\n", worker_index);
 
     while (1) {
         LogEntry entry;
 
-        pthread_mutex_lock(&buffer->mutex);
+        esperar(&itens);
+        pthread_mutex_lock(&trinco);
 
-        while (buffer->count == 0 && buffer->produtores_ativos) {
-            pthread_cond_wait(&buffer->cond_dados_disponiveis, &buffer->mutex);
-        }
-
-        if (buffer->count == 0 && !buffer->produtores_ativos) {
-            pthread_mutex_unlock(&buffer->mutex);
+        if (buffer_count == 0 && !produtores_ativos) {
+            pthread_mutex_unlock(&trinco);
             if (verbose)
                 printf("[Consumidor %d] Sem mais dados. A terminar.\n", worker_index);
             break;
         }
 
-        entry = buffer->buffer[buffer->out];
-        buffer->out = (buffer->out + 1) % BUFFER_SIZE;
-        buffer->count--;
+        entry = buffer[consptr];
+        consptr = (consptr + 1) % BUFFER_SIZE;
+        buffer_count--;
 
-        pthread_cond_signal(&buffer->cond_espaco_disponivel);
+        pthread_mutex_unlock(&trinco);
+        assinalar(&vagas);
 
-        pthread_mutex_unlock(&buffer->mutex);
+        pthread_mutex_lock(&metrics_mutex);
+        update_metrics(&global_metrics, &entry);
+        pthread_mutex_unlock(&metrics_mutex);
 
-        pthread_mutex_lock(metrics_mutex);
-        update_metrics(global_metrics, &entry);
-        pthread_mutex_unlock(metrics_mutex);
+        if (is_security_alert(&entry)) {
+            send_alert(&entry);
+        }
     }
 
     if (verbose)
