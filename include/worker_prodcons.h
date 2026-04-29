@@ -2,46 +2,46 @@
 #define WORKER_PRODCONS_H
 
 #include <pthread.h>
+#include <semaphore.h>
 #include "parser.h"
 
-/* Tamanho do buffer circular (conforme o resumo do colega) */
 #define BUFFER_SIZE 100
+#define ALERT_BUFFER_SIZE 32
 
-typedef struct {
-    LogEntry buffer[BUFFER_SIZE];    // Array circular para as linhas de log
-    int in;                          // Índice para inserção (Produtor)
-    int out;                         // Índice para remoção (Consumidor)
-    int count;                       // Quantidade de items no buffer neste momento
+extern char *ficheiros[];
+extern int total_ficheiros;
+extern int num_produtores;
+extern int verbose;
 
-    int produtores_ativos;           // Flag de terminação (1 enquanto há produtores)
+extern LogEntry buffer[BUFFER_SIZE];
+extern int prodptr;
+extern int consptr;
+extern int buffer_count;
+extern int produtores_ativos;
 
-    pthread_mutex_t mutex;           // Cadeado exclusivo
-    pthread_cond_t cond_espaco_disponivel;  // Produtor espera: buffer não cheio
-    pthread_cond_t cond_dados_disponiveis;  // Consumidor espera: buffer não vazio
-} BoundedBuffer;
+extern Metrics global_metrics;
+extern pthread_mutex_t trinco;
+extern pthread_mutex_t metrics_mutex;
+extern sem_t vagas;
+extern sem_t itens;
 
-/* =========================================================
- * Estrutura para passar argumentos para as threads
- * ========================================================= */
-typedef struct {
-    char **ficheiros;                // Lista de todos os ficheiros
-    int inicio;                      // Índice onde este worker começa
-    int fim;                         // Índice onde este worker acaba
-    int worker_index;                // ID do worker (1, 2, 3...)
-    int verbose;                     // Modo verbose (0 ou 1)
-    
-    BoundedBuffer *buffer;           // Apontador para o buffer partilhado
-    Metrics *global_metrics;         // Apontador para a variável global de resultados (para o Consumidor)
-    pthread_mutex_t *metrics_mutex;  // Apontador para o cadeado das métricas globais
-} ProducerConsumerArgs;
+extern LogEntry alert_buffer[ALERT_BUFFER_SIZE];
+extern int alert_prodptr;
+extern int alert_consptr;
+extern int alert_count;
+extern pthread_mutex_t alert_trinco;
+extern sem_t alert_vagas;
+extern sem_t alert_itens;
+extern volatile int consumidores_ativos;
 
-/* =========================================================
- * Protótipos das funções
- * ========================================================= */
-void init_bounded_buffer(BoundedBuffer *buffer);
-void destroy_bounded_buffer(BoundedBuffer *buffer);
+void init_bounded_buffer(void);
+void destroy_bounded_buffer(void);
+void init_alert_buffer(void);
+void destroy_alert_buffer(void);
+void send_alert(LogEntry *entry);
 
 void *run_producer(void *arg);
 void *run_consumer(void *arg);
+void *run_alert_monitor(void *arg);
 
 #endif /* WORKER_PRODCONS_H */
