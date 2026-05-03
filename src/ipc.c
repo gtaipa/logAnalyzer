@@ -94,49 +94,82 @@ int connect_to_server(void) {
 }
 
 /* =========================================================
- * readn - Lê exatamente 'n' bytes do descritor 'fd'
+ * readn - Le ate nbytes de forma segura a partir de fd.
+ *
+ * Em pipes e sockets, uma chamada read() pode devolver menos
+ * bytes do que os pedidos. Por isso, esta funcao repete read()
+ * ate completar nbytes, encontrar EOF, ou detetar erro real.
  * ========================================================= */
-ssize_t readn(int fd, void *ptr, size_t n) {
-    size_t nleft = n;
-    ssize_t nread;
-    char *p = ptr;
+ssize_t readn(int fd, void *ptr, size_t nbytes) {
+    // 1. Preparar o contador de bytes em falta e um ponteiro byte-a-byte para avancar no buffer do chamador.
+    size_t nleft = nbytes;
+    char *buf_ptr = ptr;
 
+    // 2. O ciclo existe porque read() em pipes/sockets nao garante entregar todos os nbytes numa unica chamada.
     while (nleft > 0) {
-        if ((nread = read(fd, p, nleft)) < 0) {
-            if (errno == EINTR) {
-                nread = 0;  /* Interrompido por um sinal, tenta de novo */
-            } else {
-                return -1;  /* Erro real */
-            }
-        } else if (nread == 0) {
-            break;          /* Fim do ficheiro (EOF) - a ligação fechou */
+        ssize_t nread = read(fd, buf_ptr, nleft);
+
+        // 3. Se read() foi interrompido por um sinal, errno fica EINTR; nao e erro logico, repetimos a leitura.
+        if (nread == -1 && errno == EINTR) {
+            continue;
         }
 
-        nleft -= nread;
-        p += nread;
+        // 4. Qualquer outro valor negativo representa erro real do sistema, logo a funcao sinaliza falha com -1.
+        if (nread == -1) {
+            return -1;
+        }
+
+        // 5. read() devolver 0 significa EOF: o escritor fechou o pipe/socket antes de enviar todos os bytes.
+        if (nread == 0) {
+            break;
+        }
+
+        // 6. Como a leitura pode ser parcial, descontamos os bytes recebidos e avancamos no destino.
+        nleft -= (size_t)nread;
+        buf_ptr += nread;
     }
-    return (n - nleft);     /* Retorna quantos bytes leu na realidade */
+
+    // 7. Retornar o total efetivamente lido permite ao chamador distinguir leitura completa de EOF prematuro.
+    return (ssize_t)(nbytes - nleft);
 }
 
 /* =========================================================
- * writen - Escreve exatamente 'n' bytes no descritor 'fd'
+ * writen - Escreve exatamente nbytes de forma segura em fd.
+ *
+ * Em pipes e sockets, write() tambem pode aceitar apenas parte
+ * dos bytes pedidos. Esta funcao continua a escrever ate enviar
+ * tudo, ou ate encontrar um erro real que impossibilite continuar.
  * ========================================================= */
-ssize_t writen(int fd, const void *ptr, size_t n) {
-    size_t nleft = n;
-    ssize_t nwritten;
-    const char *p = ptr;
+ssize_t writen(int fd, void *ptr, size_t nbytes) {
+    // 1. Preparar o contador de bytes por escrever e um ponteiro para a proxima posicao a enviar.
+    size_t nleft = nbytes;
+    char *buf_ptr = ptr;
 
+    // 2. O ciclo e obrigatorio porque write() pode fazer uma escrita parcial em pipes/sockets.
     while (nleft > 0) {
-        if ((nwritten = write(fd, p, nleft)) <= 0) {
-            if (nwritten < 0 && errno == EINTR) {
-                nwritten = 0; /* Interrompido por um sinal, tenta de novo */
-            } else {
-                return -1;    /* Erro real */
-            }
+        ssize_t nwritten = write(fd, buf_ptr, nleft);
+
+        // 3. Se write() foi interrompido por um sinal, errno == EINTR; repetimos sem perder posicao no buffer.
+        if (nwritten == -1 && errno == EINTR) {
+            continue;
         }
 
-        nleft -= nwritten;
-        p += nwritten;
+        // 4. Um erro negativo diferente de EINTR indica falha real, como pipe fechado ou descritor invalido.
+        if (nwritten == -1) {
+            return -1;
+        }
+
+        // 5. write() devolver 0 nao faz progresso; tratamos como falha para evitar um ciclo infinito.
+        if (nwritten == 0) {
+            errno = EPIPE;
+            return -1;
+        }
+
+        // 6. Como a escrita pode ser parcial, descontamos o que saiu e avancamos para o proximo byte.
+        nleft -= (size_t)nwritten;
+        buf_ptr += nwritten;
     }
-    return n;
+
+    // 7. Se o ciclo terminou, todos os nbytes foram escritos com sucesso no descritor.
+    return (ssize_t)nbytes;
 }
