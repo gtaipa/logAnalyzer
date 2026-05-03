@@ -4,6 +4,7 @@
 
 #include "log_parser.h"
 #include <stdbool.h>
+#include <stddef.h>
 
 // ============================================================================
 // TIPOS DE EVENTOS
@@ -83,9 +84,9 @@ int classify_nginx_event(const NginxErrorEntry* entry, ClassifiedEvent* event);
 bool event_matches_mode(const ClassifiedEvent* event, AnalysisMode mode);
 
 /**
- * Obtém nome do tipo de evento
+ * Obtém nome do tipo de evento usando buffer fornecido pelo chamador
  */
-const char* get_event_type_name(int event_type);
+const char* get_event_type_name(int event_type, char* buffer, size_t buf_size);
 
 /**
  * Obtém nome da severidade

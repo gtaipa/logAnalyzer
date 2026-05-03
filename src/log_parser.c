@@ -430,9 +430,13 @@ int parse_syslog_timestamp(const char* timestamp_str, struct tm* tm_out) {
     if (month == -1) return -1;
     
     time_t now = time(NULL);
-    struct tm* now_tm = localtime(&now);
+    struct tm now_tm;
+    // Usar localtime_r com estrutura local para garantir Thread-Safety e evitar Race Conditions na Fase 2.
+    if (localtime_r(&now, &now_tm) == NULL) {
+        return -1;
+    }
     
-    tm_out->tm_year = now_tm->tm_year;
+    tm_out->tm_year = now_tm.tm_year;
     tm_out->tm_mon = month;
     tm_out->tm_mday = day;
     tm_out->tm_hour = hour;

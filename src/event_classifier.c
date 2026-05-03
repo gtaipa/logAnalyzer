@@ -426,17 +426,30 @@ bool event_matches_mode(const ClassifiedEvent* event, AnalysisMode mode) {
     return (event->event_types & mode) != 0;
 }
 
-const char* get_event_type_name(int event_type) {
-    static char buffer[128];
+static void append_event_type(char* buffer, size_t buf_size, const char* text) {
+    size_t len = strlen(buffer);
+    if (len < buf_size - 1) {
+        strncat(buffer, text, buf_size - len - 1);
+    }
+}
+
+const char* get_event_type_name(int event_type, char* buffer, size_t buf_size) {
+    // 1. O chamador fornece o buffer para eliminar memoria estatica partilhada entre threads.
+    if (buffer == NULL || buf_size == 0) {
+        return NULL;
+    }
+
+    // 2. Inicializar o buffer recebido torna a funcao reentrante e evita Race Conditions exigidas pelo POSIX.
     buffer[0] = '\0';
     
-    if (event_type & EVENT_SECURITY) strcat(buffer, "SECURITY ");
-    if (event_type & EVENT_PERFORMANCE) strcat(buffer, "PERFORMANCE ");
-    if (event_type & EVENT_TRAFFIC) strcat(buffer, "TRAFFIC ");
-    if (event_type & EVENT_ERROR) strcat(buffer, "ERROR ");
-    if (event_type & EVENT_NORMAL) strcat(buffer, "NORMAL ");
+    // 3. Usar strncat com espaco restante impede Buffer Overflows mesmo com buffers pequenos.
+    if (event_type & EVENT_SECURITY) append_event_type(buffer, buf_size, "SECURITY ");
+    if (event_type & EVENT_PERFORMANCE) append_event_type(buffer, buf_size, "PERFORMANCE ");
+    if (event_type & EVENT_TRAFFIC) append_event_type(buffer, buf_size, "TRAFFIC ");
+    if (event_type & EVENT_ERROR) append_event_type(buffer, buf_size, "ERROR ");
+    if (event_type & EVENT_NORMAL) append_event_type(buffer, buf_size, "NORMAL ");
     
-    // Remover último espaço
+    // 4. Remover o espaco final conserva a apresentacao antiga sem recorrer a memoria global.
     size_t len = strlen(buffer);
     if (len > 0 && buffer[len-1] == ' ') {
         buffer[len-1] = '\0';

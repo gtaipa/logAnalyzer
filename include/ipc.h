@@ -59,8 +59,16 @@ int accept_client(int server_fd);
  * Retorna o fd do socket ligado, ou -1 em erro.
  */
 int connect_to_server(void);
-/* Funções de leitura e escrita seguras */
-ssize_t readn(int fd, void *ptr, size_t n);
-ssize_t writen(int fd, const void *ptr, size_t n);
+/* =========================================================
+ * Funções auxiliares seguras para Pipes/Sockets
+ *
+ * readn() tenta ler exatamente nbytes, repetindo read()
+ * quando ha leituras parciais ou interrupcao por sinal.
+ *
+ * writen() tenta escrever exatamente nbytes, repetindo write()
+ * quando ha escritas parciais ou interrupcao por sinal.
+ * ========================================================= */
+ssize_t readn(int fd, void *ptr, size_t nbytes);
+ssize_t writen(int fd, void *ptr, size_t nbytes);
 
 #endif /* IPC_H */
