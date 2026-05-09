@@ -4,11 +4,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include "ipc.h"
 #include "parser.h"
+#include "posix_io.h"
 #include "worker.h"
 
 #define MSG_PROGRESS 1
@@ -17,6 +19,72 @@
 typedef struct {
     int type;
 } MsgHeader;
+
+#define DASHBOARD_BAR_WIDTH 20
+
+static void desenhar_barra_progresso(char *buffer, size_t tamanho, long feito, long total) {
+    int preenchidos = 0;
+
+    if (total > 0 && feito > 0) {
+        preenchidos = (int)((feito * DASHBOARD_BAR_WIDTH) / total);
+        if (preenchidos > DASHBOARD_BAR_WIDTH) {
+            preenchidos = DASHBOARD_BAR_WIDTH;
+        }
+    }
+
+    int pos = 0;
+    if (tamanho == 0) {
+        return;
+    }
+
+    pos += snprintf(buffer + pos, tamanho - (size_t)pos, "[");
+    for (int i = 0; i < DASHBOARD_BAR_WIDTH && (size_t)pos < tamanho; i++) {
+        pos += snprintf(buffer + pos, tamanho - (size_t)pos, "%s",
+                        i < preenchidos ? "█" : "░");
+    }
+    if ((size_t)pos < tamanho) {
+        snprintf(buffer + pos, tamanho - (size_t)pos, "]");
+    }
+}
+
+static void desenhar_dashboard(const ProgressUpdate *progressos, int num_processos) {
+    posix_writef(STDOUT_FILENO, "\033[H\033[J");
+    posix_writef(STDOUT_FILENO, "=== PROGRESSO DOS WORKERS ===\n\n");
+
+    for (int i = 0; i < num_processos; i++) {
+        long total = progressos[i].lines_total;
+        long feito = progressos[i].lines_done;
+        int percentagem = 0;
+
+        if (total > 0) {
+            if (feito > total) {
+                feito = total;
+            }
+            percentagem = (int)((feito * 100) / total);
+        }
+
+        char barra[128];
+        desenhar_barra_progresso(barra, sizeof(barra), feito, total);
+
+        posix_writef(STDOUT_FILENO, "Worker %2d %s %3d%% (%ld/%ld linhas)\n",
+               progressos[i].worker_index, barra, percentagem, feito, total);
+    }
+
+}
+
+static void atualizar_dashboard_se_preciso(const ProgressUpdate *progressos,
+                                           int num_processos,
+                                           time_t *ultimo_refresh) {
+    time_t agora = time(NULL);
+    if (agora == (time_t)-1) {
+        return;
+    }
+
+    if (*ultimo_refresh == 0 || difftime(agora, *ultimo_refresh) >= 1.0) {
+        desenhar_dashboard(progressos, num_processos);
+        *ultimo_refresh = agora;
+    }
+}
 
 static void libertar_ficheiros(char **ficheiros, int total_ficheiros) {
     // 1. Libertar cada caminho antes do vetor principal evita perdas de memoria no processo pai.
@@ -38,7 +106,7 @@ static int converter_num_processos(const char *texto) {
     errno = 0;
     long valor = strtol(texto, &fim, 10);
     if (errno != 0 || fim == texto || *fim != '\0' || valor <= 0) {
-        fprintf(stderr, "Numero de processos invalido: %s\n", texto);
+        posix_writef(STDERR_FILENO, "Numero de processos invalido: %s\n", texto);
         exit(1);
     }
 
@@ -74,7 +142,7 @@ static void gerar_relatorio(WorkerResult total, char *modo, char *output_file) {
             exit(1);
         }
         fd_out = fd_file;
-        printf("\n[INFO] A gravar relatorio no ficheiro: %s\n", output_file);
+        posix_writef(STDOUT_FILENO, "\n[INFO] A gravar relatorio no ficheiro: %s\n", output_file);
     }
 
     // 5. Construir o relatorio em memoria permite fazer uma escrita POSIX unica e controlada.
@@ -115,7 +183,7 @@ static void gerar_relatorio(WorkerResult total, char *modo, char *output_file) {
                     "=================================\n");
 
     if (len < 0 || (size_t)len >= sizeof(buffer)) {
-        fprintf(stderr, "Erro: relatorio excede o buffer interno\n");
+        posix_writef(STDERR_FILENO, "Erro: relatorio excede o buffer interno\n");
         if (fd_file != -1 && close(fd_file) == -1) {
             perror("close");
         }
@@ -161,7 +229,8 @@ static void ler_diretorio_logs(const char *diretorio, char ***ficheiros_out, int
         char *nome = entrada->d_name;
         size_t len = strlen(nome);
 
-        if (len <= 4 || strcmp(nome + len - 4, ".log") != 0) {
+        if (!((len > 4 && strcmp(nome + len - 4, ".log") == 0) ||
+              (len > 5 && strcmp(nome + len - 5, ".json") == 0))) {
             continue;
         }
 
@@ -184,7 +253,7 @@ static void ler_diretorio_logs(const char *diretorio, char ***ficheiros_out, int
         char caminho[512];
         int escritos = snprintf(caminho, sizeof(caminho), "%s/%s", diretorio, nome);
         if (escritos < 0 || (size_t)escritos >= sizeof(caminho)) {
-            fprintf(stderr, "Caminho demasiado longo: %s/%s\n", diretorio, nome);
+            posix_writef(STDERR_FILENO, "Caminho demasiado longo: %s/%s\n", diretorio, nome);
             if (closedir(dir) == -1) {
                 perror("closedir");
             }
@@ -227,7 +296,7 @@ static void ler_diretorio_logs(const char *diretorio, char ***ficheiros_out, int
 int main(int argc, char *argv[]) {
     // 12. Validar argumentos antes de criar sockets ou processos evita recursos abertos em casos triviais de erro.
     if (argc < 4) {
-        printf("Uso: %s <diretorio> <num_processos> <modo> [--verbose] [--output=ficheiro.txt]\n",
+        posix_writef(STDOUT_FILENO, "Uso: %s <diretorio> <num_processos> <modo> [--verbose] [--output=ficheiro.txt]\n",
                argv[0]);
         exit(1);
     }
@@ -250,7 +319,7 @@ int main(int argc, char *argv[]) {
 
     // 14. Configurar o modo do parser antes do fork permite que os filhos herdem esta configuracao.
     if (parser_set_mode_from_string(modo) != 0) {
-        fprintf(stderr, "Modo invalido: %s (use security|performance|traffic|full)\n", modo);
+        posix_writef(STDERR_FILENO, "Modo invalido: %s (use security|performance|traffic|full)\n", modo);
         exit(1);
     }
 
@@ -260,7 +329,7 @@ int main(int argc, char *argv[]) {
 
     // 15. Sem ficheiros nao ha comunicacao: o programa termina antes de criar socket Unix ou filhos.
     if (total_ficheiros == 0) {
-        printf("Nenhum ficheiro .log encontrado.\n");
+        posix_writef(STDOUT_FILENO, "Nenhum ficheiro .log ou .json encontrado.\n");
         libertar_ficheiros(ficheiros, total_ficheiros);
         exit(0);
     }
@@ -373,6 +442,32 @@ int main(int argc, char *argv[]) {
 
     WorkerResult total = {0};
     int resultados_recebidos = 0;
+    ProgressUpdate *progressos = calloc((size_t)num_processos, sizeof(ProgressUpdate));
+    if (progressos == NULL) {
+        perror("calloc");
+        free(client_fds);
+        free(pids);
+        if (close(server_fd) == -1) {
+            perror("close");
+        }
+        if (unlink(SOCKET_PATH) == -1) {
+            perror("unlink");
+        }
+        libertar_ficheiros(ficheiros, total_ficheiros);
+        exit(1);
+    }
+
+    for (int i = 0; i < num_processos; i++) {
+        progressos[i].pid = pids[i];
+        progressos[i].worker_index = i;
+        progressos[i].lines_done = 0;
+        progressos[i].lines_total = 0;
+    }
+
+    time_t ultimo_refresh_dashboard = 0;
+    if (verbose) {
+        atualizar_dashboard_se_preciso(progressos, num_processos, &ultimo_refresh_dashboard);
+    }
 
     // 22. Ler mensagens dos clientes; cada WorkerResult e recebido com readn() para evitar leituras parciais.
     while (resultados_recebidos < num_processos) {
@@ -388,11 +483,11 @@ int main(int argc, char *argv[]) {
                 exit(1);
             }
             if (lidos == 0) {
-                fprintf(stderr, "Erro: worker fechou socket antes de enviar resultado\n");
+                posix_writef(STDERR_FILENO, "Erro: worker fechou socket antes de enviar resultado\n");
                 exit(1);
             }
             if (lidos != (ssize_t)sizeof(hdr)) {
-                fprintf(stderr, "Erro: cabecalho incompleto recebido do worker\n");
+                posix_writef(STDERR_FILENO, "Erro: cabecalho incompleto recebido do worker\n");
                 exit(1);
             }
 
@@ -405,12 +500,15 @@ int main(int argc, char *argv[]) {
                     exit(1);
                 }
                 if (lidos != (ssize_t)sizeof(progresso)) {
-                    fprintf(stderr, "Erro: progresso incompleto recebido do worker\n");
+                    posix_writef(STDERR_FILENO, "Erro: progresso incompleto recebido do worker\n");
                     exit(1);
                 }
+                if (progresso.worker_index >= 0 && progresso.worker_index < num_processos) {
+                    progressos[progresso.worker_index] = progresso;
+                }
                 if (verbose) {
-                    printf("[PAI] Worker %d: %ld/%ld linhas\n",
-                           progresso.worker_index, progresso.lines_done, progresso.lines_total);
+                    atualizar_dashboard_se_preciso(progressos, num_processos,
+                                                   &ultimo_refresh_dashboard);
                 }
             } else if (hdr.type == MSG_RESULT) {
                 // 24. A estrutura WorkerResult contem o resumo final e e lida obrigatoriamente com readn().
@@ -421,12 +519,18 @@ int main(int argc, char *argv[]) {
                     exit(1);
                 }
                 if (lidos != (ssize_t)sizeof(r)) {
-                    fprintf(stderr, "Erro: WorkerResult incompleto recebido do worker\n");
+                    posix_writef(STDERR_FILENO, "Erro: WorkerResult incompleto recebido do worker\n");
                     exit(1);
                 }
 
                 acumular_resultado(&total, &r);
                 resultados_recebidos++;
+                for (int j = 0; j < num_processos; j++) {
+                    if (progressos[j].pid == r.pid) {
+                        progressos[j].lines_done = progressos[j].lines_total;
+                        break;
+                    }
+                }
 
                 // 25. Depois do resultado final, o pai fecha o socket cliente porque ja recebeu tudo desse worker.
                 if (close(client_fds[i]) == -1) {
@@ -435,10 +539,20 @@ int main(int argc, char *argv[]) {
                 }
                 client_fds[i] = -1;
             } else {
-                fprintf(stderr, "Erro: tipo de mensagem desconhecido: %d\n", hdr.type);
+                posix_writef(STDERR_FILENO, "Erro: tipo de mensagem desconhecido: %d\n", hdr.type);
                 exit(1);
             }
         }
+    }
+
+    if (verbose) {
+        time_t agora = time(NULL);
+        if (agora != (time_t)-1 && ultimo_refresh_dashboard != 0 &&
+            difftime(agora, ultimo_refresh_dashboard) < 1.0) {
+            sleep(1);
+        }
+        desenhar_dashboard(progressos, num_processos);
+        posix_writef(STDOUT_FILENO, "\n");
     }
 
     // 26. Fechar o socket servidor impede novas ligacoes depois de todos os resultados terem chegado.
@@ -464,11 +578,11 @@ int main(int argc, char *argv[]) {
         if (WIFEXITED(status)) {
             int codigo = WEXITSTATUS(status);
             if (codigo != 0) {
-                fprintf(stderr, "[PAI] Filho %d terminou com codigo %d\n", pids[i], codigo);
+                posix_writef(STDERR_FILENO, "[PAI] Filho %d terminou com codigo %d\n", pids[i], codigo);
                 exit(1);
             }
         } else {
-            fprintf(stderr, "[PAI] Filho %d nao terminou por exit normal\n", pids[i]);
+            posix_writef(STDERR_FILENO, "[PAI] Filho %d nao terminou por exit normal\n", pids[i]);
             exit(1);
         }
     }
@@ -476,6 +590,7 @@ int main(int argc, char *argv[]) {
     gerar_relatorio(total, modo, output_file);
 
     // 29. Libertar memoria do pai apos fechar sockets e recolher filhos conclui a limpeza do processo principal.
+    free(progressos);
     free(client_fds);
     free(pids);
     libertar_ficheiros(ficheiros, total_ficheiros);

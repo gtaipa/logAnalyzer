@@ -1,5 +1,6 @@
 #include "ipc.h"
 #include "parser.h"
+#include "posix_io.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -176,14 +177,14 @@ void run_worker_pipe(char **ficheiros, int inicio, int fim, int pipe_fd_write, i
     init_metrics(&m);
 
     if (verbose) {
-        printf("[Filho %d] Vou processar %d ficheiro(s) (%d..%d)\n",
+        posix_writef(STDOUT_FILENO, "[Filho %d] Vou processar %d ficheiro(s) (%d..%d)\n",
                getpid(), fim - inicio, inicio, fim - 1);
     }
 
     // 23. Processar cada caminho atribuido a este worker usando apenas open(), read() e close() no ficheiro.
     for (int i = inicio; i < fim; i++) {
         if (verbose) {
-            printf("[Filho %d] A processar: %s\n", getpid(), ficheiros[i]);
+            posix_writef(STDOUT_FILENO, "[Filho %d] A processar: %s\n", getpid(), ficheiros[i]);
         }
 
         if (process_file(ficheiros[i], &m) == -1) {

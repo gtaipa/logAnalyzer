@@ -49,8 +49,14 @@ int main(void) {
         // Fica à espera e lê a estrutura do tubo
         read(fd[0], &res, sizeof(Resultados));
         
-        // Imprime o que recebeu do filho
-        printf("Pai recebeu: %ld linhas e %d erros\n", res.linhas, res.erros);
+        // Escreve o que recebeu do filho usando write()
+        char buffer[128];
+        int len = snprintf(buffer, sizeof(buffer),
+                           "Pai recebeu: %ld linhas e %d erros\n",
+                           res.linhas, res.erros);
+        if (len > 0) {
+            write(STDOUT_FILENO, buffer, (size_t)len);
+        }
         
         close(fd[0]); // Fecha a porta de leitura
         wait(NULL);   // Espera que o filho morra (para não virar zombie)

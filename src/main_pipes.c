@@ -8,6 +8,7 @@
 
 #include "ipc.h"
 #include "parser.h"
+#include "posix_io.h"
 
 void run_worker_pipe(char **ficheiros, int inicio, int fim, int pipe_fd_write, int verbose);
 
@@ -31,7 +32,7 @@ static int converter_num_processos(const char *texto) {
     errno = 0;
     long valor = strtol(texto, &fim, 10);
     if (errno != 0 || fim == texto || *fim != '\0' || valor <= 0) {
-        fprintf(stderr, "Numero de processos invalido: %s\n", texto);
+        posix_writef(STDERR_FILENO, "Numero de processos invalido: %s\n", texto);
         exit(1);
     }
 
@@ -52,21 +53,21 @@ static void acumular_resultado(WorkerResult *total, const WorkerResult *result) 
 
 static void imprimir_relatorio(const WorkerResult *total) {
     // Mostrar o relatorio apenas depois da leitura dos pipes garante que todos os dados foram agregados.
-    printf("\n=== RELATORIO FINAL ===\n");
-    printf("Total de linhas : %ld\n", total->total_lines);
-    printf("DEBUG           : %ld\n", total->count_debug);
-    printf("INFO            : %ld\n", total->count_info);
-    printf("WARNINGS        : %ld\n", total->count_warn);
-    printf("ERRORS          : %ld\n", total->count_error);
-    printf("CRITICAL        : %ld\n", total->count_critical);
-    printf("4xx             : %ld\n", total->count_4xx);
-    printf("5xx             : %ld\n", total->count_5xx);
+    posix_writef(STDOUT_FILENO, "\n=== RELATORIO FINAL ===\n");
+    posix_writef(STDOUT_FILENO, "Total de linhas : %ld\n", total->total_lines);
+    posix_writef(STDOUT_FILENO, "DEBUG           : %ld\n", total->count_debug);
+    posix_writef(STDOUT_FILENO, "INFO            : %ld\n", total->count_info);
+    posix_writef(STDOUT_FILENO, "WARNINGS        : %ld\n", total->count_warn);
+    posix_writef(STDOUT_FILENO, "ERRORS          : %ld\n", total->count_error);
+    posix_writef(STDOUT_FILENO, "CRITICAL        : %ld\n", total->count_critical);
+    posix_writef(STDOUT_FILENO, "4xx             : %ld\n", total->count_4xx);
+    posix_writef(STDOUT_FILENO, "5xx             : %ld\n", total->count_5xx);
 }
 
 int main(int argc, char *argv[]) {
     // 1. Validar argumentos no processo principal antes de criar qualquer recurso POSIX.
     if (argc < 4) {
-        printf("Uso: %s <diretorio> <num_processos> <modo> [--verbose]\n", argv[0]);
+        posix_writef(STDOUT_FILENO, "Uso: %s <diretorio> <num_processos> <modo> [--verbose]\n", argv[0]);
         exit(1);
     }
 
@@ -82,14 +83,14 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    printf("Diretorio: %s\n", diretorio);
-    printf("Processos: %d\n", num_processos);
-    printf("Modo: %s\n", modo);
-    printf("Verbose: %s\n", verbose ? "sim" : "nao");
+    posix_writef(STDOUT_FILENO, "Diretorio: %s\n", diretorio);
+    posix_writef(STDOUT_FILENO, "Processos: %d\n", num_processos);
+    posix_writef(STDOUT_FILENO, "Modo: %s\n", modo);
+    posix_writef(STDOUT_FILENO, "Verbose: %s\n", verbose ? "sim" : "nao");
 
     // 3. Configurar o parser uma unica vez no pai para que os filhos herdem esse estado apos fork().
     if (parser_set_mode_from_string(modo) != 0) {
-        fprintf(stderr, "Modo invalido: %s (use security|performance|traffic|full)\n", modo);
+        posix_writef(STDERR_FILENO, "Modo invalido: %s (use security|performance|traffic|full)\n", modo);
         exit(1);
     }
 
@@ -117,7 +118,8 @@ int main(int argc, char *argv[]) {
         char *nome = entrada->d_name;
         size_t len = strlen(nome);
 
-        if (len <= 4 || strcmp(nome + len - 4, ".log") != 0) {
+        if (!((len > 4 && strcmp(nome + len - 4, ".log") == 0) ||
+              (len > 5 && strcmp(nome + len - 5, ".json") == 0))) {
             continue;
         }
 
@@ -140,7 +142,7 @@ int main(int argc, char *argv[]) {
         char caminho[512];
         int escritos = snprintf(caminho, sizeof(caminho), "%s/%s", diretorio, nome);
         if (escritos < 0 || (size_t)escritos >= sizeof(caminho)) {
-            fprintf(stderr, "Caminho demasiado longo: %s/%s\n", diretorio, nome);
+            posix_writef(STDERR_FILENO, "Caminho demasiado longo: %s/%s\n", diretorio, nome);
             if (closedir(dir) == -1) {
                 perror("closedir");
             }
@@ -159,7 +161,7 @@ int main(int argc, char *argv[]) {
         }
 
         if (verbose) {
-            printf("Encontrei: %s\n", ficheiros[total_ficheiros]);
+            posix_writef(STDOUT_FILENO, "Encontrei: %s\n", ficheiros[total_ficheiros]);
         }
         total_ficheiros++;
     }
@@ -180,11 +182,11 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
-    printf("Total de ficheiros .log encontrados: %d\n", total_ficheiros);
+    posix_writef(STDOUT_FILENO, "Total de ficheiros .log/.json encontrados: %d\n", total_ficheiros);
 
     // 10. Terminar sem criar filhos quando nao ha trabalho para distribuir.
     if (total_ficheiros == 0) {
-        printf("Nenhum ficheiro .log encontrado.\n");
+        posix_writef(STDOUT_FILENO, "Nenhum ficheiro .log ou .json encontrado.\n");
         libertar_ficheiros(ficheiros, total_ficheiros);
         exit(0);
     }
@@ -192,7 +194,7 @@ int main(int argc, char *argv[]) {
     // 11. Limitar workers ao numero de ficheiros evita processos sem trabalho e simplifica a distribuicao.
     if (num_processos > total_ficheiros) {
         num_processos = total_ficheiros;
-        printf("Ajustado para %d processo(s)\n", num_processos);
+        posix_writef(STDOUT_FILENO, "Ajustado para %d processo(s)\n", num_processos);
     }
 
     // 12. Guardar PIDs e descritores de leitura permite ao pai ler resultados e recolher estados corretamente.
@@ -304,12 +306,12 @@ int main(int argc, char *argv[]) {
             exit(1);
         }
         if (bytes_lidos != (ssize_t)sizeof(result)) {
-            fprintf(stderr, "Erro: leitura incompleta do worker %d (%zd de %zu bytes)\n",
+            posix_writef(STDERR_FILENO, "Erro: leitura incompleta do worker %d (%zd de %zu bytes)\n",
                     i, bytes_lidos, sizeof(result));
             exit(1);
         }
 
-        printf("[PAI] Recebi dados do Filho %d\n", result.pid);
+        posix_writef(STDOUT_FILENO, "[PAI] Recebi dados do Filho %d\n", result.pid);
         acumular_resultado(&total, &result);
 
         // 21. Fechar a extremidade de leitura apos consumir o resultado liberta o descritor do pipe.
@@ -331,11 +333,11 @@ int main(int argc, char *argv[]) {
         if (WIFEXITED(status)) {
             int codigo = WEXITSTATUS(status);
             if (codigo != 0) {
-                fprintf(stderr, "[PAI] Filho %d terminou com codigo %d\n", pids[i], codigo);
+                posix_writef(STDERR_FILENO, "[PAI] Filho %d terminou com codigo %d\n", pids[i], codigo);
                 exit(1);
             }
         } else {
-            fprintf(stderr, "[PAI] Filho %d nao terminou por exit normal\n", pids[i]);
+            posix_writef(STDERR_FILENO, "[PAI] Filho %d nao terminou por exit normal\n", pids[i]);
             exit(1);
         }
     }

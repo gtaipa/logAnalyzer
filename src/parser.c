@@ -51,6 +51,34 @@ static int extract_ipv4(const char *s, char out[IP_LEN]) {
     return -1;
 }
 
+static const char *skip_syslog_priority(const char *line) {
+    const char *p = line;
+
+    if (*p != '<') {
+        return p;
+    }
+
+    p++;
+    if (!isdigit((unsigned char)*p)) {
+        return line;
+    }
+
+    while (isdigit((unsigned char)*p)) {
+        p++;
+    }
+
+    return *p == '>' ? p + 1 : line;
+}
+
+static int looks_like_syslog_timestamp(const char *line) {
+    return strlen(line) > 15 &&
+           isalpha((unsigned char)line[0]) &&
+           isalpha((unsigned char)line[1]) &&
+           isalpha((unsigned char)line[2]) &&
+           line[3] == ' ' &&
+           (isdigit((unsigned char)line[4]) || line[4] == ' ');
+}
+
 int parser_set_mode_from_string(const char *mode_str) {
     if (!mode_str) return -1;
     if (strcasecmp(mode_str, "security") == 0) g_mode = MODE_SECURITY;
@@ -97,12 +125,7 @@ LogFormat detect_format(const char *line) {
         return FORMAT_NGINX_ERROR;
     }
 
-    if (strlen(line) > 15 &&
-        isalpha((unsigned char)line[0]) &&
-        isalpha((unsigned char)line[1]) &&
-        isalpha((unsigned char)line[2]) &&
-        line[3] == ' ' &&
-        (isdigit((unsigned char)line[4]) || line[4] == ' ')) {
+    if (looks_like_syslog_timestamp(skip_syslog_priority(line))) {
         return FORMAT_SYSLOG;
     }
 
@@ -236,4 +259,3 @@ void update_metrics(Metrics *m, const LogEntry *e) {
 void init_metrics(Metrics *m) {
     memset(m, 0, sizeof(Metrics));
 }
-

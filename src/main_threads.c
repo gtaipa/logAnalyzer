@@ -7,6 +7,7 @@
 #include <time.h>
 #include <fcntl.h>
 
+#include "posix_io.h"
 #include "worker_threads.h"
 
 #define MAX_THREADS 64
@@ -22,8 +23,8 @@ static int    g_dashboard_enabled = 0;
 /* Função que desenha a interface (idêntica aos sockets) */
 static void draw_dashboard(void) {
     int linhas = g_num_workers + 7;
-    printf("\033[%dA", linhas); // Move o cursor para cima
-    printf("\033[J");           // Limpa o ecrã abaixo do cursor
+    posix_writef(STDOUT_FILENO, "\033[%dA", linhas); // Move o cursor para cima
+    posix_writef(STDOUT_FILENO, "\033[J");           // Limpa o ecrã abaixo do cursor
 
     time_t elapsed = time(NULL) - g_start_time;
     int hh = elapsed / 3600;
@@ -39,9 +40,9 @@ static void draw_dashboard(void) {
     int total_pct = (total_total > 0) ? (int)(total_done * 100 / total_total) : 0;
     if (total_pct > 100) total_pct = 100;
 
-    printf("╔══════════════════════════════════════════╗\n");
-    printf("║    LOG ANALYZER - THREADS MONITOR        ║\n");
-    printf("╠══════════════════════════════════════════╣\n");
+    posix_writef(STDOUT_FILENO, "╔══════════════════════════════════════════╗\n");
+    posix_writef(STDOUT_FILENO, "║    LOG ANALYZER - THREADS MONITOR        ║\n");
+    posix_writef(STDOUT_FILENO, "╠══════════════════════════════════════════╣\n");
 
     for (int i = 0; i < g_num_workers; i++) {
         int pct = (g_lines_total[i] > 0) ? (int)(g_lines_done[i] * 100 / g_lines_total[i]) : 0;
@@ -52,19 +53,19 @@ static void draw_dashboard(void) {
         for (int b = 0; b < 20; b++) bar[b] = (b < filled) ? '#' : '.';
         bar[20] = '\0';
 
-        printf("║ Thread %-2d [%s] %3d%%           ║\n", i + 1, bar, pct);
+        posix_writef(STDOUT_FILENO, "║ Thread %-2d [%s] %3d%%           ║\n", i + 1, bar, pct);
     }
 
-    printf("╠══════════════════════════════════════════╣\n");
+    posix_writef(STDOUT_FILENO, "╠══════════════════════════════════════════╣\n");
 
     char tot_bar[21];
     int tot_filled = total_pct / 5;
     for (int b = 0; b < 20; b++) tot_bar[b] = (b < tot_filled) ? '#' : '.';
     tot_bar[20] = '\0';
 
-    printf("║ Total     [%s] %3d%%           ║\n", tot_bar, total_pct);
-    printf("║ Elapsed: %02d:%02d:%02d                      ║\n", hh, mm, ss);
-    printf("╚══════════════════════════════════════════╝\n");
+    posix_writef(STDOUT_FILENO, "║ Total     [%s] %3d%%           ║\n", tot_bar, total_pct);
+    posix_writef(STDOUT_FILENO, "║ Elapsed: %02d:%02d:%02d                      ║\n", hh, mm, ss);
+    posix_writef(STDOUT_FILENO, "╚══════════════════════════════════════════╝\n");
 }
 
 /* Thread Monitora: Fica em loop a desenhar o dashboard até os workers acabarem */
@@ -86,7 +87,7 @@ void gerar_relatorio_threads(Metrics *total, char *modo, char *output_file) {
         fd_file = open(output_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd_file >= 0) {
             fd_out = fd_file;
-            printf("\n[INFO] A gravar relatorio no ficheiro: %s\n", output_file);
+            posix_writef(STDOUT_FILENO, "\n[INFO] A gravar relatorio no ficheiro: %s\n", output_file);
         }
     }
 
@@ -119,12 +120,10 @@ void gerar_relatorio_threads(Metrics *total, char *modo, char *output_file) {
 }
 
 int main(int argc, char *argv[]) {
-    /* Dashboard usa ANSI + printf; sem TTY alguns runners deixam stdout fully-buffered. */
-    setvbuf(stdout, NULL, _IONBF, 0);
     g_dashboard_enabled = isatty(STDOUT_FILENO);
 
     if (argc < 4) {
-        printf("Uso: %s <diretorio> <num_threads> <modo> [--verbose] [--output=ficheiro.txt]\n", argv[0]);
+        posix_writef(STDOUT_FILENO, "Uso: %s <diretorio> <num_threads> <modo> [--verbose] [--output=ficheiro.txt]\n", argv[0]);
         exit(1);
     }
 
@@ -141,7 +140,7 @@ int main(int argc, char *argv[]) {
     }
 
     if (parser_set_mode_from_string(modo) != 0) {
-        fprintf(stderr, "Modo invalido: %s (use security|performance|traffic|full)\n", modo);
+        posix_writef(STDERR_FILENO, "Modo invalido: %s (use security|performance|traffic|full)\n", modo);
         exit(1);
     }
 
@@ -153,7 +152,8 @@ int main(int argc, char *argv[]) {
     struct dirent *entrada;
     while ((entrada = readdir(dir)) != NULL) {
         int len = strlen(entrada->d_name);
-        if (len > 4 && strcmp(entrada->d_name + len - 4, ".log") == 0) {
+        if ((len > 4 && strcmp(entrada->d_name + len - 4, ".log") == 0) ||
+            (len > 5 && strcmp(entrada->d_name + len - 5, ".json") == 0)) {
             if (total_ficheiros == capacidade) {
                 capacidade *= 2;
                 ficheiros = realloc(ficheiros, capacidade * sizeof(char *));
@@ -166,7 +166,7 @@ int main(int argc, char *argv[]) {
     closedir(dir);
 
     if (total_ficheiros == 0) {
-        printf("Nenhum ficheiro .log encontrado.\n");
+        posix_writef(STDOUT_FILENO, "Nenhum ficheiro .log ou .json encontrado.\n");
         exit(0);
     }
     if (num_threads > total_ficheiros) num_threads = total_ficheiros;
@@ -191,7 +191,7 @@ int main(int argc, char *argv[]) {
 
     if (g_dashboard_enabled) {
         // Imprime linhas em branco suficientes para o dashboard não sobrescrever prints anteriores
-        for (int i = 0; i < g_num_workers + 7; i++) printf("\n");
+        for (int i = 0; i < g_num_workers + 7; i++) posix_writef(STDOUT_FILENO, "\n");
 
         /* 1. Lançar a Thread Monitora */
         pthread_create(&monitor_thread, NULL, run_monitor_thread, NULL);
