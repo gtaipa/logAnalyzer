@@ -10,6 +10,7 @@
 
 #include "worker_prodcons.h"
 #include "parser.h"
+#include "posix_io.h"
 
 #define MAX_FICHEIROS 100
 #define MAX_CAMINHO 256
@@ -49,7 +50,7 @@ void gerar_relatorio_prodcons(Metrics *total, char *modo, char *output_file) {
         fd_file = open(output_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd_file >= 0) {
             fd_out = fd_file; // Passamos a escrever para este descritor
-            printf("\n[INFO] A gravar relatorio no ficheiro: %s\n", output_file);
+            posix_writef(STDOUT_FILENO, "\n[INFO] A gravar relatorio no ficheiro: %s\n", output_file);
         } else {
             perror("Erro ao abrir ficheiro de output");
         }
@@ -96,7 +97,7 @@ void gerar_relatorio_prodcons(Metrics *total, char *modo, char *output_file) {
 
 int main(int argc, char *argv[]) {
     if (argc < 5) {
-        printf("Uso: %s <diretorio> <num_produtores> <num_consumidores> <modo> [--verbose] [--output=ficheiro.txt]\n",
+        posix_writef(STDOUT_FILENO, "Uso: %s <diretorio> <num_produtores> <num_consumidores> <modo> [--verbose] [--output=ficheiro.txt]\n",
                argv[0]);
         exit(1);
     }
@@ -107,8 +108,8 @@ int main(int argc, char *argv[]) {
     char *modo           = argv[4];
 
     if (num_produtores < 1 || num_consumidores < 1) {
-        fprintf(stderr, "Erro: num_produtores e num_consumidores tem de ser >= 1.\n");
-        fprintf(stderr, "Uso: %s <diretorio> <num_produtores> <num_consumidores> <modo> [--verbose] [--output=ficheiro.txt]\n",
+        posix_writef(STDERR_FILENO, "Erro: num_produtores e num_consumidores tem de ser >= 1.\n");
+        posix_writef(STDERR_FILENO, "Uso: %s <diretorio> <num_produtores> <num_consumidores> <modo> [--verbose] [--output=ficheiro.txt]\n",
                 argv[0]);
         exit(1);
     }
@@ -122,17 +123,17 @@ int main(int argc, char *argv[]) {
     }
 
     if (parser_set_mode_from_string(modo) != 0) {
-        fprintf(stderr, "Modo invalido: %s (use security|performance|traffic|full)\n", modo);
+        posix_writef(STDERR_FILENO, "Modo invalido: %s (use security|performance|traffic|full)\n", modo);
         exit(1);
     }
 
     if (num_produtores > MAX_PRODUTORES) {
-        printf("[MAIN] Numero de produtores ajustado para %d (limite fixo).\n", MAX_PRODUTORES);
+        posix_writef(STDOUT_FILENO, "[MAIN] Numero de produtores ajustado para %d (limite fixo).\n", MAX_PRODUTORES);
         num_produtores = MAX_PRODUTORES;
     }
 
     if (num_consumidores > MAX_CONSUMIDORES) {
-        printf("[MAIN] Numero de consumidores ajustado para %d (limite fixo).\n", MAX_CONSUMIDORES);
+        posix_writef(STDOUT_FILENO, "[MAIN] Numero de consumidores ajustado para %d (limite fixo).\n", MAX_CONSUMIDORES);
         num_consumidores = MAX_CONSUMIDORES;
     }
 
@@ -146,9 +147,10 @@ int main(int argc, char *argv[]) {
     struct dirent *entrada;
     while ((entrada = readdir(dir)) != NULL) {
         int len = strlen(entrada->d_name);
-        if (len > 4 && strcmp(entrada->d_name + len - 4, ".log") == 0) {
+        if ((len > 4 && strcmp(entrada->d_name + len - 4, ".log") == 0) ||
+            (len > 5 && strcmp(entrada->d_name + len - 5, ".json") == 0)) {
             if (total_ficheiros == MAX_FICHEIROS) {
-                fprintf(stderr, "[WARN] Limite de %d ficheiros atingido; restantes .log ignorados.\n", MAX_FICHEIROS);
+                posix_writef(STDERR_FILENO, "[WARN] Limite de %d ficheiros atingido; restantes .log/.json ignorados.\n", MAX_FICHEIROS);
                 break;
             }
 
@@ -161,7 +163,7 @@ int main(int argc, char *argv[]) {
             );
 
             if (n < 0 || n >= (int)sizeof(ficheiros_storage[total_ficheiros])) {
-                fprintf(stderr, "[WARN] Caminho demasiado longo, ignorado: %s/%s\n", diretorio, entrada->d_name);
+                posix_writef(STDERR_FILENO, "[WARN] Caminho demasiado longo, ignorado: %s/%s\n", diretorio, entrada->d_name);
                 continue;
             }
 
@@ -172,14 +174,14 @@ int main(int argc, char *argv[]) {
     closedir(dir);
 
     if (total_ficheiros == 0) {
-        printf("Nenhum ficheiro .log encontrado em %s.\n", diretorio);
+        posix_writef(STDOUT_FILENO, "Nenhum ficheiro .log ou .json encontrado em %s.\n", diretorio);
         exit(0);
     }
 
     if (num_produtores > total_ficheiros) num_produtores = total_ficheiros;
 
-    printf("[MAIN] Descobertos %d ficheiros de log.\n", total_ficheiros);
-    printf("[MAIN] A usar %d produtores e %d consumidores.\n",
+    posix_writef(STDOUT_FILENO, "[MAIN] Descobertos %d ficheiros de log.\n", total_ficheiros);
+    posix_writef(STDOUT_FILENO, "[MAIN] A usar %d produtores e %d consumidores.\n",
            num_produtores, num_consumidores);
 
     init_bounded_buffer();
@@ -194,7 +196,7 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
     
-    printf("[MAIN] A lançar %d threads produtoras...\n", num_produtores);
+    posix_writef(STDOUT_FILENO, "[MAIN] A lançar %d threads produtoras...\n", num_produtores);
 
     produtores_ativos = 1;
 
@@ -207,7 +209,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    printf("[MAIN] A lançar %d threads consumidoras...\n", num_consumidores);
+    posix_writef(STDOUT_FILENO, "[MAIN] A lançar %d threads consumidoras...\n", num_consumidores);
 
     for (int i = 0; i < num_consumidores; i++) {
         consumer_ids[i] = i + 1;
@@ -218,13 +220,13 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    printf("[MAIN] Aguardando que os produtores terminem...\n");
+    posix_writef(STDOUT_FILENO, "[MAIN] Aguardando que os produtores terminem...\n");
 
     for (int i = 0; i < num_produtores; i++) {
         pthread_join(producer_threads[i], NULL);
     }
 
-    printf("[MAIN] Todos os produtores terminaram!\n");
+    posix_writef(STDOUT_FILENO, "[MAIN] Todos os produtores terminaram!\n");
 
     pthread_mutex_lock(&trinco);
     produtores_ativos = 0;
@@ -234,15 +236,15 @@ int main(int argc, char *argv[]) {
         sem_post(&itens);
     }
 
-    printf("[MAIN] Sinalizou aos consumidores: fim de turno dos produtores!\n");
+    posix_writef(STDOUT_FILENO, "[MAIN] Sinalizou aos consumidores: fim de turno dos produtores!\n");
 
-    printf("[MAIN] Aguardando que os consumidores terminem...\n");
+    posix_writef(STDOUT_FILENO, "[MAIN] Aguardando que os consumidores terminem...\n");
 
     for (int i = 0; i < num_consumidores; i++) {
         pthread_join(consumer_threads[i], NULL);
     }
 
-    printf("[MAIN] Todos os consumidores terminaram!\n");
+    posix_writef(STDOUT_FILENO, "[MAIN] Todos os consumidores terminaram!\n");
 
     pthread_mutex_lock(&alert_trinco);
     consumidores_ativos = 0;
@@ -256,6 +258,6 @@ int main(int argc, char *argv[]) {
 
     gerar_relatorio_prodcons(&global_metrics, modo, output_file);
 
-    printf("[MAIN] Programa terminou com sucesso!\n");
+    posix_writef(STDOUT_FILENO, "[MAIN] Programa terminou com sucesso!\n");
     return 0;
 }

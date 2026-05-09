@@ -1,5 +1,6 @@
 #include "worker_prodcons.h"
 #include "parser.h"
+#include "posix_io.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -126,7 +127,7 @@ static int is_security_alert(const LogEntry *entry) {
 void send_alert(LogEntry *entry) {
     if (sem_trywait(&alert_vagas) != 0) {
         if (errno == EAGAIN) {
-            fprintf(stderr, "[AVISO] Buffer de alertas cheio! Alerta descartado: %s\n",
+            posix_writef(STDERR_FILENO, "[AVISO] Buffer de alertas cheio! Alerta descartado: %s\n",
                     entry->message);
             return;
         }
@@ -219,7 +220,7 @@ static void process_file_prodcons(const char *path, int worker_index) {
         return;
     }
 
-    if (verbose) printf("[Produtor %d] A abrir: %s\n", worker_index, path);
+    if (verbose) posix_writef(STDOUT_FILENO, "[Produtor %d] A abrir: %s\n", worker_index, path);
 
     char buf[BUF_SIZE];
     char line[LINE_MAX];
@@ -259,7 +260,7 @@ static void process_file_prodcons(const char *path, int worker_index) {
     }
 
     close(fd);
-    if (verbose) printf("[Produtor %d] Terminou o ficheiro: %s\n", worker_index, path);
+    if (verbose) posix_writef(STDOUT_FILENO, "[Produtor %d] Terminou o ficheiro: %s\n", worker_index, path);
 }
 
 void *run_producer(void *arg) {
@@ -271,7 +272,7 @@ void *run_producer(void *arg) {
         : inicio + ficheiros_por_produtor;
 
     if (verbose)
-        printf("[Produtor %d] A comecar a processar ficheiros [%d, %d)\n",
+        posix_writef(STDOUT_FILENO, "[Produtor %d] A comecar a processar ficheiros [%d, %d)\n",
                worker_index, inicio, fim);
 
     for (int i = inicio; i < fim; i++) {
@@ -279,7 +280,7 @@ void *run_producer(void *arg) {
     }
 
     if (verbose)
-        printf("[Produtor %d] Terminou todos os ficheiros!\n", worker_index);
+        posix_writef(STDOUT_FILENO, "[Produtor %d] Terminou todos os ficheiros!\n", worker_index);
 
     pthread_exit(NULL);
 }
@@ -288,7 +289,7 @@ void *run_consumer(void *arg) {
     int worker_index = *(int *)arg;
 
     if (verbose)
-        printf("[Consumidor %d] A comecar a processar o buffer...\n", worker_index);
+        posix_writef(STDOUT_FILENO, "[Consumidor %d] A comecar a processar o buffer...\n", worker_index);
 
     while (1) {
         LogEntry entry;
@@ -299,7 +300,7 @@ void *run_consumer(void *arg) {
         if (buffer_count == 0 && !produtores_ativos) {
             pthread_mutex_unlock(&trinco);
             if (verbose)
-                printf("[Consumidor %d] Sem mais dados. A terminar.\n", worker_index);
+                posix_writef(STDOUT_FILENO, "[Consumidor %d] Sem mais dados. A terminar.\n", worker_index);
             break;
         }
 
@@ -320,7 +321,7 @@ void *run_consumer(void *arg) {
     }
 
     if (verbose)
-        printf("[Consumidor %d] Saiu do loop principal.\n", worker_index);
+        posix_writef(STDOUT_FILENO, "[Consumidor %d] Saiu do loop principal.\n", worker_index);
 
     pthread_exit(NULL);
 }

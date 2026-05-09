@@ -138,6 +138,7 @@ static char* extract_json_value(const char* json, const char* key, char* value, 
 
 int parse_json_log(const char* line, JSONLogEntry* entry) {
     if (!line || !entry) return -1;
+    if (line[0] != '{') return -1;
     
     memset(entry, 0, sizeof(JSONLogEntry));
     

@@ -1,10 +1,10 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -pthread -I./include
 
-SOCKET_SRC = src/main_sockets.c src/parser.c src/log_parser.c src/event_classifier.c src/worker_sockets.c src/ipc.c
-PIPES_SRC  = src/main_pipes.c src/parser.c src/log_parser.c src/event_classifier.c src/worker_pipes.c src/ipc.c
-THREADS_SRC = src/main_threads.c src/parser.c src/log_parser.c src/event_classifier.c src/worker_threads.c
-PRODCONS_SRC = src/main_prodcons.c src/parser.c src/log_parser.c src/event_classifier.c src/worker_prodcons.c
+SOCKET_SRC = src/main_sockets.c src/parser.c src/log_parser.c src/event_classifier.c src/worker_sockets.c src/ipc.c src/posix_io.c
+PIPES_SRC  = src/main_pipes.c src/parser.c src/log_parser.c src/event_classifier.c src/worker_pipes.c src/ipc.c src/posix_io.c
+THREADS_SRC = src/main_threads.c src/parser.c src/log_parser.c src/event_classifier.c src/worker_threads.c src/posix_io.c
+PRODCONS_SRC = src/main_prodcons.c src/parser.c src/log_parser.c src/event_classifier.c src/worker_prodcons.c src/posix_io.c
 
 all: sockets pipes threads prodcons
 
