@@ -1,71 +1,137 @@
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <sys/select.h>
 #include <unistd.h>
 
 #include "ipc.h"
 #include "parser.h"
 #include "posix_io.h"
+#include "worker.h"
 
-void run_worker_pipe(char **ficheiros, int inicio, int fim, int pipe_fd_write, int verbose);
+#define MSG_PROGRESSO 1
+#define MSG_RESULTADO 2
+#define LARGURA_BARRA 20
+
+void run_worker_pipe(char **ficheiros, int total_ficheiros, int pipe_fd_write, 
+                     int worker_index, long linha_inicio, long linha_fim, int verbose);
+
+static void desenhar_dashboard(ProgressUpdate *progressos, int num_workers) {
+    printf("\033[%dA", num_workers);
+    printf("\033[J");
+
+    for (int i = 0; i < num_workers; i++) {
+        long feitas = progressos[i].lines_done;
+        long total  = progressos[i].lines_total;
+
+        int pct = (total > 0) ? (int)(feitas * 100 / total) : 0;
+        if (pct > 100) pct = 100;
+
+        char barra[LARGURA_BARRA + 1];
+        int cheio = pct * LARGURA_BARRA / 100;
+        for (int b = 0; b < LARGURA_BARRA; b++)
+            barra[b] = (b < cheio) ? '#' : '.';
+        barra[LARGURA_BARRA] = '\0';
+
+        printf("Worker %2d [%s] %3d%% (%ld/%ld linhas)\n",
+               i, barra, pct, feitas, total);
+    }
+    fflush(stdout);
+}
 
 static void libertar_ficheiros(char **ficheiros, int total_ficheiros) {
-    // Libertar cada string antes do vetor evita fugas de memoria no processo pai.
-    if (ficheiros == NULL) {
-        return;
-    }
-
-    for (int i = 0; i < total_ficheiros; i++) {
-        free(ficheiros[i]);
-    }
-
+    if (ficheiros == NULL) return;
+    for (int i = 0; i < total_ficheiros; i++) free(ficheiros[i]);
     free(ficheiros);
+}
+
+static long contar_todas_linhas(char **ficheiros, int total_ficheiros) {
+    #define BUF_SIZE 4096
+    long total = 0;
+    for (int i = 0; i < total_ficheiros; i++) {
+        int fd = open(ficheiros[i], O_RDONLY);
+        if (fd < 0) continue;
+        char buf[BUF_SIZE];
+        int bytes;
+        while ((bytes = read(fd, buf, BUF_SIZE)) > 0) {
+            for (int j = 0; j < bytes; j++)
+                if (buf[j] == '\n') total++;
+        }
+        close(fd);
+    }
+    return total;
 }
 
 static int converter_num_processos(const char *texto) {
     char *fim = NULL;
-
-    // Validar o numero de processos impede divisao por zero e argumentos parcialmente invalidos.
     errno = 0;
     long valor = strtol(texto, &fim, 10);
     if (errno != 0 || fim == texto || *fim != '\0' || valor <= 0) {
         posix_writef(STDERR_FILENO, "Numero de processos invalido: %s\n", texto);
         exit(1);
     }
-
     return (int)valor;
 }
 
-static void acumular_resultado(WorkerResult *total, const WorkerResult *result) {
-    // Somar no pai centraliza os resultados porque os filhos nao partilham memoria apos fork().
-    total->total_lines += result->total_lines;
-    total->count_debug += result->count_debug;
-    total->count_info += result->count_info;
-    total->count_warn += result->count_warn;
-    total->count_error += result->count_error;
-    total->count_critical += result->count_critical;
-    total->count_4xx += result->count_4xx;
-    total->count_5xx += result->count_5xx;
+static void acumular_resultado(WorkerResult *total, const WorkerResult *r, 
+                               char ip_list_global[256][IP_LEN], long ip_count_global[256], int *ip_num_global) {
+    total->total_lines += r->total_lines;
+    total->count_debug += r->count_debug;
+    total->count_info += r->count_info;
+    total->count_warn += r->count_warn;
+    total->count_error += r->count_error;
+    total->count_critical += r->count_critical;
+    total->count_4xx += r->count_4xx;
+    total->count_5xx += r->count_5xx;
+
+    if (r->top_ip[0] != '-' && r->top_ip[0] != '\0') {
+        int found = -1;
+        for (int i = 0; i < *ip_num_global; i++) {
+            if (strcmp(ip_list_global[i], r->top_ip) == 0) {
+                found = i;
+                break;
+            }
+        }
+        if (found == -1 && *ip_num_global < 256) {
+            strncpy(ip_list_global[*ip_num_global], r->top_ip, IP_LEN - 1);
+            ip_count_global[*ip_num_global] = 1;
+            (*ip_num_global)++;
+        } else if (found >= 0) {
+            ip_count_global[found]++;
+        }
+    }
+    
+    long max_count = 0;
+    int top_idx = -1;
+    for (int i = 0; i < *ip_num_global; i++) {
+        if (ip_count_global[i] > max_count) {
+            max_count = ip_count_global[i];
+            top_idx = i;
+        }
+    }
+    if (top_idx >= 0)
+        strncpy(total->top_ip, ip_list_global[top_idx], IP_LEN - 1);
 }
 
-static void imprimir_relatorio(const WorkerResult *total) {
-    // Mostrar o relatorio apenas depois da leitura dos pipes garante que todos os dados foram agregados.
-    posix_writef(STDOUT_FILENO, "\n=== RELATORIO FINAL ===\n");
-    posix_writef(STDOUT_FILENO, "Total de linhas : %ld\n", total->total_lines);
-    posix_writef(STDOUT_FILENO, "DEBUG           : %ld\n", total->count_debug);
-    posix_writef(STDOUT_FILENO, "INFO            : %ld\n", total->count_info);
-    posix_writef(STDOUT_FILENO, "WARNINGS        : %ld\n", total->count_warn);
-    posix_writef(STDOUT_FILENO, "ERRORS          : %ld\n", total->count_error);
-    posix_writef(STDOUT_FILENO, "CRITICAL        : %ld\n", total->count_critical);
-    posix_writef(STDOUT_FILENO, "4xx             : %ld\n", total->count_4xx);
-    posix_writef(STDOUT_FILENO, "5xx             : %ld\n", total->count_5xx);
+static void imprimir_relatorio(const WorkerResult *total, char *modo) {
+    printf("\n=== RELATORIO FINAL (%s) ===\n", modo);
+    printf("Total de linhas  : %ld\n", total->total_lines);
+    printf("DEBUG            : %ld\n", total->count_debug);
+    printf("INFO             : %ld\n", total->count_info);
+    printf("WARNINGS         : %ld\n", total->count_warn);
+    printf("ERRORS           : %ld\n", total->count_error);
+    printf("CRITICAL         : %ld\n", total->count_critical);
+    printf("HTTP 4xx         : %ld\n", total->count_4xx);
+    printf("HTTP 5xx         : %ld\n", total->count_5xx);
+    printf("IP mais frequente: %s\n",  total->top_ip[0] ? total->top_ip : "N/A");
+    printf("=================================\n");
 }
 
 int main(int argc, char *argv[]) {
-    // 1. Validar argumentos no processo principal antes de criar qualquer recurso POSIX.
     if (argc < 4) {
         posix_writef(STDOUT_FILENO, "Uso: %s <diretorio> <num_processos> <modo> [--verbose]\n", argv[0]);
         exit(1);
@@ -75,45 +141,24 @@ int main(int argc, char *argv[]) {
     int num_processos = converter_num_processos(argv[2]);
     char *modo = argv[3];
 
-    // 2. Interpretar flags opcionais antes do trabalho pesado para manter a configuracao imutavel.
     int verbose = 0;
     for (int i = 4; i < argc; i++) {
-        if (strcmp(argv[i], "--verbose") == 0) {
-            verbose = 1;
-        }
+        if (strcmp(argv[i], "--verbose") == 0) verbose = 1;
     }
 
-    posix_writef(STDOUT_FILENO, "Diretorio: %s\n", diretorio);
-    posix_writef(STDOUT_FILENO, "Processos: %d\n", num_processos);
-    posix_writef(STDOUT_FILENO, "Modo: %s\n", modo);
-    posix_writef(STDOUT_FILENO, "Verbose: %s\n", verbose ? "sim" : "nao");
-
-    // 3. Configurar o parser uma unica vez no pai para que os filhos herdem esse estado apos fork().
     if (parser_set_mode_from_string(modo) != 0) {
-        posix_writef(STDERR_FILENO, "Modo invalido: %s (use security|performance|traffic|full)\n", modo);
+        posix_writef(STDERR_FILENO, "Modo invalido: %s\n", modo);
         exit(1);
     }
 
-    // 4. Reservar memoria dinamica para guardar os caminhos dos ficheiros encontrados no diretorio.
     int capacidade = 10;
     int total_ficheiros = 0;
     char **ficheiros = malloc((size_t)capacidade * sizeof(char *));
-    if (ficheiros == NULL) {
-        perror("malloc");
-        exit(1);
-    }
 
-    // 5. Abrir o diretorio no pai porque a descoberta de ficheiros acontece antes da divisao por workers.
     DIR *dir = opendir(diretorio);
-    if (dir == NULL) {
-        perror("opendir");
-        libertar_ficheiros(ficheiros, total_ficheiros);
-        exit(1);
-    }
+    if (dir == NULL) { perror("opendir"); exit(1); }
 
-    // 6. Percorrer o diretorio e guardar apenas ficheiros com extensao .log para processamento.
     struct dirent *entrada;
-    errno = 0;
     while ((entrada = readdir(dir)) != NULL) {
         char *nome = entrada->d_name;
         size_t len = strlen(nome);
@@ -123,231 +168,150 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        // 7. Aumentar o vetor antes de inserir novo caminho para nao escrever fora dos limites.
         if (total_ficheiros == capacidade) {
             capacidade *= 2;
-            char **novo = realloc(ficheiros, (size_t)capacidade * sizeof(char *));
-            if (novo == NULL) {
-                perror("realloc");
-                if (closedir(dir) == -1) {
-                    perror("closedir");
-                }
-                libertar_ficheiros(ficheiros, total_ficheiros);
-                exit(1);
-            }
-            ficheiros = novo;
+            ficheiros = realloc(ficheiros, (size_t)capacidade * sizeof(char *));
         }
 
-        // 8. Construir o caminho completo para que cada worker consiga abrir o ficheiro correto.
         char caminho[512];
-        int escritos = snprintf(caminho, sizeof(caminho), "%s/%s", diretorio, nome);
-        if (escritos < 0 || (size_t)escritos >= sizeof(caminho)) {
-            posix_writef(STDERR_FILENO, "Caminho demasiado longo: %s/%s\n", diretorio, nome);
-            if (closedir(dir) == -1) {
-                perror("closedir");
-            }
-            libertar_ficheiros(ficheiros, total_ficheiros);
-            exit(1);
-        }
-
-        ficheiros[total_ficheiros] = strdup(caminho);
-        if (ficheiros[total_ficheiros] == NULL) {
-            perror("strdup");
-            if (closedir(dir) == -1) {
-                perror("closedir");
-            }
-            libertar_ficheiros(ficheiros, total_ficheiros);
-            exit(1);
-        }
-
-        if (verbose) {
-            posix_writef(STDOUT_FILENO, "Encontrei: %s\n", ficheiros[total_ficheiros]);
-        }
-        total_ficheiros++;
+        snprintf(caminho, sizeof(caminho), "%s/%s", diretorio, nome);
+        ficheiros[total_ficheiros++] = strdup(caminho);
     }
+    closedir(dir);
 
-    // 9. Verificar erros de readdir e fechar o diretorio assim que a descoberta termina.
-    if (errno != 0) {
-        perror("readdir");
-        if (closedir(dir) == -1) {
-            perror("closedir");
-        }
-        libertar_ficheiros(ficheiros, total_ficheiros);
-        exit(1);
-    }
-
-    if (closedir(dir) == -1) {
-        perror("closedir");
-        libertar_ficheiros(ficheiros, total_ficheiros);
-        exit(1);
-    }
-
-    posix_writef(STDOUT_FILENO, "Total de ficheiros .log/.json encontrados: %d\n", total_ficheiros);
-
-    // 10. Terminar sem criar filhos quando nao ha trabalho para distribuir.
     if (total_ficheiros == 0) {
-        posix_writef(STDOUT_FILENO, "Nenhum ficheiro .log ou .json encontrado.\n");
+        posix_writef(STDOUT_FILENO, "Nenhum ficheiro encontrado.\n");
         libertar_ficheiros(ficheiros, total_ficheiros);
         exit(0);
     }
 
-    // 11. Limitar workers ao numero de ficheiros evita processos sem trabalho e simplifica a distribuicao.
+    posix_writef(STDOUT_FILENO, "A contar linhas totais...\n");
+    long total_linhas = contar_todas_linhas(ficheiros, total_ficheiros);
+    posix_writef(STDOUT_FILENO, "Total de linhas encontradas: %ld\n\n", total_linhas);
+    
+    long linhas_por_worker = total_linhas / num_processos;
+    
+    WorkerConfig *configs = malloc((size_t)num_processos * sizeof(WorkerConfig));
+    for (int i = 0; i < num_processos; i++) {
+        configs[i].linha_inicio = i * linhas_por_worker;
+        configs[i].linha_fim = (i == num_processos - 1) ? total_linhas : configs[i].linha_inicio + linhas_por_worker;
+    }
+
     if (num_processos > total_ficheiros) {
         num_processos = total_ficheiros;
-        posix_writef(STDOUT_FILENO, "Ajustado para %d processo(s)\n", num_processos);
     }
 
-    // 12. Guardar PIDs e descritores de leitura permite ao pai ler resultados e recolher estados corretamente.
     pid_t *pids = malloc((size_t)num_processos * sizeof(pid_t));
-    if (pids == NULL) {
-        perror("malloc");
-        libertar_ficheiros(ficheiros, total_ficheiros);
-        exit(1);
-    }
-
     int *pipes_leitura = malloc((size_t)num_processos * sizeof(int));
-    if (pipes_leitura == NULL) {
-        perror("malloc");
-        free(pids);
-        libertar_ficheiros(ficheiros, total_ficheiros);
-        exit(1);
-    }
+    for (int i = 0; i < num_processos; i++) pipes_leitura[i] = -1;
 
-    for (int i = 0; i < num_processos; i++) {
-        pipes_leitura[i] = -1;
-    }
-
-    int ficheiros_por_processo = total_ficheiros / num_processos;
-
-    // 13. Esvaziar buffers de stdio antes do fork evita que os filhos repitam mensagens ja impressas pelo pai.
-    if (fflush(NULL) == EOF) {
-        perror("fflush");
-        free(pipes_leitura);
-        free(pids);
-        libertar_ficheiros(ficheiros, total_ficheiros);
-        exit(1);
-    }
+    fflush(NULL);
 
     for (int i = 0; i < num_processos; i++) {
         int fd[2];
-        pid_t pid;
+        if (pipe(fd) == -1) { perror("pipe"); exit(1); }
 
-        // 14. Criar o pipe anonimo antes do fork para pai e filho herdarem os mesmos descritores.
-        if (pipe(fd) == -1) {
-            perror("pipe");
-            free(pipes_leitura);
-            free(pids);
-            libertar_ficheiros(ficheiros, total_ficheiros);
-            exit(1);
-        }
-
-        // 15. Criar o processo com o padrao POSIX classico e abortar perante erro de fork().
-        if ((pid = fork()) == -1) {
-            perror("fork");
-            if (close(fd[0]) == -1) {
-                perror("close");
-            }
-            if (close(fd[1]) == -1) {
-                perror("close");
-            }
-            free(pipes_leitura);
-            free(pids);
-            libertar_ficheiros(ficheiros, total_ficheiros);
-            exit(1);
-        }
+        pid_t pid = fork();
+        if (pid < 0) { perror("fork"); exit(1); }
 
         if (pid == 0) {
-            // 16. No filho, fechar imediatamente a extremidade de leitura porque o worker apenas escreve.
-            if (close(fd[0]) == -1) {
-                perror("close");
-                exit(1);
-            }
-
-            // 17. No filho, fechar leituras herdadas de pipes anteriores para manter a tabela de descritores limpa.
+            close(fd[0]);
             for (int j = 0; j < i; j++) {
-                if (pipes_leitura[j] != -1 && close(pipes_leitura[j]) == -1) {
-                    perror("close");
-                    exit(1);
-                }
+                if (pipes_leitura[j] != -1) close(pipes_leitura[j]);
             }
-
-            // 18. Calcular o intervalo de ficheiros deste worker antes de delegar o processamento.
-            int inicio = i * ficheiros_por_processo;
-            int fim = (i == num_processos - 1) ? total_ficheiros : inicio + ficheiros_por_processo;
-
-            run_worker_pipe(ficheiros, inicio, fim, fd[1], verbose);
+            // Chama a rotina com o worker_index (i) inserido!
+            run_worker_pipe(ficheiros, total_ficheiros, fd[1], i, 
+                           configs[i].linha_inicio, configs[i].linha_fim, verbose);
             exit(0);
         }
 
-        // 19. No pai, fechar imediatamente a extremidade de escrita porque o pai apenas le resultados.
-        if (close(fd[1]) == -1) {
-            perror("close");
-            if (close(fd[0]) == -1) {
-                perror("close");
-            }
-            free(pipes_leitura);
-            free(pids);
-            libertar_ficheiros(ficheiros, total_ficheiros);
-            exit(1);
-        }
-
+        close(fd[1]);
         pids[i] = pid;
         pipes_leitura[i] = fd[0];
     }
 
-    WorkerResult total = {0};
-
-    // 20. Ler um WorkerResult completo de cada pipe usando readn para evitar leituras parciais.
+    // Preparar o dashboard no terminal
+    ProgressUpdate *progressos = calloc(num_processos, sizeof(ProgressUpdate));
     for (int i = 0; i < num_processos; i++) {
-        WorkerResult result;
-        ssize_t bytes_lidos = readn(pipes_leitura[i], &result, sizeof(result));
-        if (bytes_lidos == -1) {
-            perror("readn");
-            exit(1);
-        }
-        if (bytes_lidos != (ssize_t)sizeof(result)) {
-            posix_writef(STDERR_FILENO, "Erro: leitura incompleta do worker %d (%zd de %zu bytes)\n",
-                    i, bytes_lidos, sizeof(result));
-            exit(1);
-        }
+        progressos[i].worker_index = i;
+        printf("Worker %2d [....................] -- Aguardar...\n", i);
+    }
+    fflush(stdout);
 
-        posix_writef(STDOUT_FILENO, "[PAI] Recebi dados do Filho %d\n", result.pid);
-        acumular_resultado(&total, &result);
+    WorkerResult total = {0};
+    int resultados = 0;
+    
+    char ip_list_global[256][IP_LEN];
+    long ip_count_global[256] = {0};
+    int ip_num_global = 0;
 
-        // 21. Fechar a extremidade de leitura apos consumir o resultado liberta o descritor do pipe.
-        if (close(pipes_leitura[i]) == -1) {
-            perror("close");
-            exit(1);
+    // Select loop (Pai servidor assíncrono para os Pipes)
+    while (resultados < num_processos) {
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        int max_fd = -1;
+        
+        for (int i = 0; i < num_processos; i++) {
+            if (pipes_leitura[i] != -1) {
+                FD_SET(pipes_leitura[i], &readfds);
+                if (pipes_leitura[i] > max_fd) max_fd = pipes_leitura[i];
+            }
         }
-        pipes_leitura[i] = -1;
+        
+        struct timeval tv;
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+        
+        int activity = select(max_fd + 1, &readfds, NULL, NULL, &tv);
+        if (activity < 0) { perror("select"); exit(1); }
+        if (activity == 0) continue;
+        
+        for (int i = 0; i < num_processos; i++) {
+            if (pipes_leitura[i] != -1 && FD_ISSET(pipes_leitura[i], &readfds)) {
+                int tipo;
+                ssize_t lidos = read(pipes_leitura[i], &tipo, sizeof(tipo));
+                
+                if (lidos <= 0) {
+                    close(pipes_leitura[i]);
+                    pipes_leitura[i] = -1;
+                    resultados++;
+                    continue;
+                }
+
+                if (tipo == MSG_PROGRESSO) {
+                    ProgressUpdate pu;
+                    read(pipes_leitura[i], &pu, sizeof(pu));
+                    progressos[pu.worker_index] = pu;
+                    desenhar_dashboard(progressos, num_processos);
+
+                } else if (tipo == MSG_RESULTADO) {
+                    WorkerResult r;
+                    read(pipes_leitura[i], &r, sizeof(r));
+                    acumular_resultado(&total, &r, (char (*)[IP_LEN])ip_list_global, ip_count_global, &ip_num_global);
+
+                    progressos[i].lines_done = progressos[i].lines_total;
+                    desenhar_dashboard(progressos, num_processos);
+
+                    close(pipes_leitura[i]);
+                    pipes_leitura[i] = -1;
+                    resultados++;
+                }
+            }
+        }
     }
 
-    // 22. Recolher cada filho com waitpid e interpretar o estado com as macros POSIX adequadas.
     for (int i = 0; i < num_processos; i++) {
         int status;
-        if (waitpid(pids[i], &status, 0) == -1) {
-            perror("waitpid");
-            exit(1);
-        }
-
-        if (WIFEXITED(status)) {
-            int codigo = WEXITSTATUS(status);
-            if (codigo != 0) {
-                posix_writef(STDERR_FILENO, "[PAI] Filho %d terminou com codigo %d\n", pids[i], codigo);
-                exit(1);
-            }
-        } else {
-            posix_writef(STDERR_FILENO, "[PAI] Filho %d nao terminou por exit normal\n", pids[i]);
-            exit(1);
-        }
+        waitpid(pids[i], &status, 0);
     }
 
-    imprimir_relatorio(&total);
+    imprimir_relatorio(&total, modo);
 
-    // 23. Libertar memoria reservada pelo pai antes de terminar o processo principal.
+    free(progressos);
     free(pipes_leitura);
     free(pids);
+    free(configs);
     libertar_ficheiros(ficheiros, total_ficheiros);
 
-    exit(0);
+    return 0;
 }

@@ -74,5 +74,7 @@ int connect_to_server(void);
  * ========================================================= */
 ssize_t readn(int fd, void *ptr, size_t nbytes);
 ssize_t writen(int fd, void *ptr, size_t nbytes);
+void run_worker_pipe(char **ficheiros, int total_ficheiros, int pipe_fd_write, 
+                     int worker_index, long linha_inicio, long linha_fim, int verbose);
 
 #endif /* IPC_H */
