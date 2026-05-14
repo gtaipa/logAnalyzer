@@ -1,599 +1,467 @@
+/*
+ * main_sockets.c  —  Código do processo PAI
+ *
+ * O pai faz a orquestração toda:
+ *   1. Lê o directório e descobre os ficheiros de log.
+ *   2. Cria um socket Unix e fica à escuta.
+ *   3. Cria N filhos com fork(), cada um com uma fatia dos ficheiros.
+ *   4. Aceita as ligações dos filhos e lê as mensagens que eles enviam:
+ *        MSG_PROGRESSO → actualiza o dashboard no ecrã
+ *        MSG_RESULTADO → acumula as contagens no total geral
+ *   5. Quando todos os filhos terminaram, imprime o relatório final.
+ *
+ * Protocolo de mensagens (igual ao worker):
+ *   Cada mensagem começa com um int:
+ *     1 = MSG_PROGRESSO  →  a seguir vem um ProgressUpdate
+ *     2 = MSG_RESULTADO  →  a seguir vem um WorkerResult
+ */
+
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 #include <sys/wait.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include "ipc.h"
 #include "parser.h"
-#include "posix_io.h"
 #include "worker.h"
 
-#define MSG_PROGRESS 1
-#define MSG_RESULT 2
+#define MSG_PROGRESSO 1
+#define MSG_RESULTADO 2
 
-typedef struct {
-    int type;
-} MsgHeader;
+/* ═════════════════════════════════════════════════════════════════════════════
+ * DASHBOARD
+ *
+ * O dashboard funciona com um truque de terminal:
+ *   - Imprimimos uma linha por worker no início (para "reservar" espaço).
+ *   - Quando queremos actualizar, subimos o cursor N linhas com \033[NA,
+ *     apagamos tudo abaixo com \033[J, e voltamos a imprimir as barras.
+ *   - O resultado visual é uma animação in-place sem scroll.
+ * ════════════════════════════════════════════════════════════════════════════= */
 
-#define DASHBOARD_BAR_WIDTH 20
+#define LARGURA_BARRA 20
 
-static void desenhar_barra_progresso(char *buffer, size_t tamanho, long feito, long total) {
-    int preenchidos = 0;
+static void desenhar_dashboard(ProgressUpdate *progressos, int num_workers) {
+    /* Subir o cursor tantas linhas quantos workers existem */
+    printf("\033[%dA", num_workers);
+    /* Apagar tudo abaixo do cursor (as linhas antigas) */
+    printf("\033[J");
 
-    if (total > 0 && feito > 0) {
-        preenchidos = (int)((feito * DASHBOARD_BAR_WIDTH) / total);
-        if (preenchidos > DASHBOARD_BAR_WIDTH) {
-            preenchidos = DASHBOARD_BAR_WIDTH;
-        }
+    for (int i = 0; i < num_workers; i++) {
+        long feitas = progressos[i].lines_done;
+        long total  = progressos[i].lines_total;
+
+        int pct = (total > 0) ? (int)(feitas * 100 / total) : 0;
+        if (pct > 100) pct = 100;
+
+        /* Construir a barra de progresso com '#' e '.' */
+        char barra[LARGURA_BARRA + 1];
+        int cheio = pct * LARGURA_BARRA / 100;
+        for (int b = 0; b < LARGURA_BARRA; b++)
+            barra[b] = (b < cheio) ? '#' : '.';
+        barra[LARGURA_BARRA] = '\0';
+
+        printf("Worker %2d [%s] %3d%% (%ld/%ld linhas)\n",
+               i, barra, pct, feitas, total);
     }
 
-    int pos = 0;
-    if (tamanho == 0) {
-        return;
-    }
-
-    pos += snprintf(buffer + pos, tamanho - (size_t)pos, "[");
-    for (int i = 0; i < DASHBOARD_BAR_WIDTH && (size_t)pos < tamanho; i++) {
-        pos += snprintf(buffer + pos, tamanho - (size_t)pos, "%s",
-                        i < preenchidos ? "█" : "░");
-    }
-    if ((size_t)pos < tamanho) {
-        snprintf(buffer + pos, tamanho - (size_t)pos, "]");
-    }
+    fflush(stdout); /* forçar o flush — o terminal pode ter buffering */
 }
 
-static void desenhar_dashboard(const ProgressUpdate *progressos, int num_processos) {
-    posix_writef(STDOUT_FILENO, "\033[H\033[J");
-    posix_writef(STDOUT_FILENO, "=== PROGRESSO DOS WORKERS ===\n\n");
+/* ═════════════════════════════════════════════════════════════════════════════
+ * UTILITÁRIOS DO PAI
+ * ════════════════════════════════════════════════════════════════════════════= */
 
-    for (int i = 0; i < num_processos; i++) {
-        long total = progressos[i].lines_total;
-        long feito = progressos[i].lines_done;
-        int percentagem = 0;
-
-        if (total > 0) {
-            if (feito > total) {
-                feito = total;
-            }
-            percentagem = (int)((feito * 100) / total);
-        }
-
-        char barra[128];
-        desenhar_barra_progresso(barra, sizeof(barra), feito, total);
-
-        posix_writef(STDOUT_FILENO, "Worker %2d %s %3d%% (%ld/%ld linhas)\n",
-               progressos[i].worker_index, barra, percentagem, feito, total);
-    }
-
-}
-
-static void atualizar_dashboard_se_preciso(const ProgressUpdate *progressos,
-                                           int num_processos,
-                                           time_t *ultimo_refresh) {
-    time_t agora = time(NULL);
-    if (agora == (time_t)-1) {
-        return;
-    }
-
-    if (*ultimo_refresh == 0 || difftime(agora, *ultimo_refresh) >= 1.0) {
-        desenhar_dashboard(progressos, num_processos);
-        *ultimo_refresh = agora;
-    }
-}
-
-static void libertar_ficheiros(char **ficheiros, int total_ficheiros) {
-    // 1. Libertar cada caminho antes do vetor principal evita perdas de memoria no processo pai.
-    if (ficheiros == NULL) {
-        return;
-    }
-
-    for (int i = 0; i < total_ficheiros; i++) {
-        free(ficheiros[i]);
-    }
-
+/* Libertar o array de caminhos de ficheiros */
+static void libertar_ficheiros(char **ficheiros, int total) {
+    for (int i = 0; i < total; i++) free(ficheiros[i]);
     free(ficheiros);
 }
 
-static int converter_num_processos(const char *texto) {
-    char *fim = NULL;
-
-    // 2. Validar o numero de processos impede fork()s indevidos e evita divisao por zero.
-    errno = 0;
-    long valor = strtol(texto, &fim, 10);
-    if (errno != 0 || fim == texto || *fim != '\0' || valor <= 0) {
-        posix_writef(STDERR_FILENO, "Numero de processos invalido: %s\n", texto);
-        exit(1);
+/* Contar o número total de linhas em TODOS os ficheiros (uma só vez) */
+static long contar_todas_linhas(char **ficheiros, int total_ficheiros) {
+    #define BUF_SIZE 4096
+    long total = 0;
+    
+    for (int i = 0; i < total_ficheiros; i++) {
+        int fd = open(ficheiros[i], O_RDONLY);
+        if (fd < 0) continue;
+        
+        char buf[BUF_SIZE];
+        int bytes;
+        while ((bytes = read(fd, buf, BUF_SIZE)) > 0) {
+            for (int j = 0; j < bytes; j++)
+                if (buf[j] == '\n') total++;
+        }
+        close(fd);
     }
-
-    return (int)valor;
+    return total;
 }
 
-static void acumular_resultado(WorkerResult *total, const WorkerResult *r) {
-    // 3. O pai agrega resultados porque cada filho tem espaco de enderecamento proprio apos fork().
-    total->total_lines += r->total_lines;
-    total->count_debug += r->count_debug;
-    total->count_info += r->count_info;
-    total->count_warn += r->count_warn;
-    total->count_error += r->count_error;
-    total->count_critical += r->count_critical;
-    total->count_4xx += r->count_4xx;
-    total->count_5xx += r->count_5xx;
-
-    if (total->top_ip[0] == '\0' && r->top_ip[0] != '\0') {
-        strncpy(total->top_ip, r->top_ip, IP_LEN - 1);
-        total->top_ip[IP_LEN - 1] = '\0';
-    }
-}
-
-static void gerar_relatorio(WorkerResult total, char *modo, char *output_file) {
-    // 4. Por omissao, o relatorio e escrito no stdout; opcionalmente redireciona-se para ficheiro com open().
-    int fd_out = STDOUT_FILENO;
-    int fd_file = -1;
-
-    if (output_file != NULL) {
-        fd_file = open(output_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (fd_file == -1) {
-            perror("open");
-            exit(1);
-        }
-        fd_out = fd_file;
-        posix_writef(STDOUT_FILENO, "\n[INFO] A gravar relatorio no ficheiro: %s\n", output_file);
-    }
-
-    // 5. Construir o relatorio em memoria permite fazer uma escrita POSIX unica e controlada.
-    char buffer[4096];
-    int len = 0;
-
-    len += snprintf(buffer + len, sizeof(buffer) - (size_t)len,
-                    "\n=== RELATORIO FINAL (%s) ===\n", modo);
-    len += snprintf(buffer + len, sizeof(buffer) - (size_t)len,
-                    "Total de linhas : %ld\n", total.total_lines);
-
-    if (strcmp(modo, "security") == 0 || strcmp(modo, "full") == 0) {
-        len += snprintf(buffer + len, sizeof(buffer) - (size_t)len,
-                        "\n--- ALERTAS DE SEGURANCA ---\n");
-        len += snprintf(buffer + len, sizeof(buffer) - (size_t)len,
-                        "WARNINGS        : %ld\n", total.count_warn);
-        len += snprintf(buffer + len, sizeof(buffer) - (size_t)len,
-                        "ERRORS          : %ld\n", total.count_error);
-        len += snprintf(buffer + len, sizeof(buffer) - (size_t)len,
-                        "CRITICAL        : %ld\n", total.count_critical);
-        len += snprintf(buffer + len, sizeof(buffer) - (size_t)len,
-                        "HTTP 4xx/5xx    : %ld\n", total.count_4xx + total.count_5xx);
-    }
-
-    if (strcmp(modo, "traffic") == 0 || strcmp(modo, "full") == 0) {
-        len += snprintf(buffer + len, sizeof(buffer) - (size_t)len,
-                        "\n--- ESTATISTICAS DE TRAFEGO ---\n");
-        len += snprintf(buffer + len, sizeof(buffer) - (size_t)len,
-                        "INFO            : %ld\n", total.count_info);
-        len += snprintf(buffer + len, sizeof(buffer) - (size_t)len,
-                        "DEBUG           : %ld\n", total.count_debug);
-        len += snprintf(buffer + len, sizeof(buffer) - (size_t)len,
-                        "IP Mais Frequente: %s\n",
-                        total.top_ip[0] != '\0' ? total.top_ip : "N/A");
-    }
-
-    len += snprintf(buffer + len, sizeof(buffer) - (size_t)len,
-                    "=================================\n");
-
-    if (len < 0 || (size_t)len >= sizeof(buffer)) {
-        posix_writef(STDERR_FILENO, "Erro: relatorio excede o buffer interno\n");
-        if (fd_file != -1 && close(fd_file) == -1) {
-            perror("close");
-        }
-        exit(1);
-    }
-
-    // 6. writen() garante que todo o relatorio e enviado, mesmo que write() faca escritas parciais.
-    if (writen(fd_out, buffer, (size_t)len) == -1) {
-        perror("writen");
-        if (fd_file != -1 && close(fd_file) == -1) {
-            perror("close");
-        }
-        exit(1);
-    }
-
-    if (fd_file != -1 && close(fd_file) == -1) {
-        perror("close");
-        exit(1);
-    }
-}
-
-static void ler_diretorio_logs(const char *diretorio, char ***ficheiros_out, int *total_out) {
-    // 7. Reservar um vetor dinamico permite guardar todos os caminhos antes de dividir trabalho pelos filhos.
+/* Ler o directório e devolver um array com os caminhos dos .log e .json */
+static char **ler_directorio(const char *dir, int *total_out) {
     int capacidade = 10;
-    int total_ficheiros = 0;
-    char **ficheiros = malloc((size_t)capacidade * sizeof(char *));
-    if (ficheiros == NULL) {
-        perror("malloc");
-        exit(1);
-    }
+    int total = 0;
+    char **ficheiros = malloc(capacidade * sizeof(char *));
+    if (!ficheiros) { perror("malloc"); exit(1); }
 
-    // 8. O pai percorre o diretorio antes do fork para que todos os filhos herdem a mesma lista de caminhos.
-    DIR *dir = opendir(diretorio);
-    if (dir == NULL) {
-        perror("opendir");
-        libertar_ficheiros(ficheiros, total_ficheiros);
-        exit(1);
-    }
+    DIR *d = opendir(dir);
+    if (!d) { perror("opendir"); exit(1); }
 
     struct dirent *entrada;
-    errno = 0;
-    while ((entrada = readdir(dir)) != NULL) {
+    while ((entrada = readdir(d)) != NULL) {
         char *nome = entrada->d_name;
-        size_t len = strlen(nome);
+        int len = strlen(nome);
 
-        if (!((len > 4 && strcmp(nome + len - 4, ".log") == 0) ||
-              (len > 5 && strcmp(nome + len - 5, ".json") == 0))) {
-            continue;
-        }
+        /* Só nos interessam ficheiros .log e .json */
+        int e_log  = (len > 4 && strcmp(nome + len - 4, ".log")  == 0);
+        int e_json = (len > 5 && strcmp(nome + len - 5, ".json") == 0);
+        if (!e_log && !e_json) continue;
 
-        // 9. Aumentar o vetor antes de inserir evita escrever para alem da memoria reservada.
-        if (total_ficheiros == capacidade) {
+        /* Crescer o array se necessário */
+        if (total == capacidade) {
             capacidade *= 2;
-            char **novo = realloc(ficheiros, (size_t)capacidade * sizeof(char *));
-            if (novo == NULL) {
-                perror("realloc");
-                if (closedir(dir) == -1) {
-                    perror("closedir");
-                }
-                libertar_ficheiros(ficheiros, total_ficheiros);
-                exit(1);
-            }
-            ficheiros = novo;
+            ficheiros = realloc(ficheiros, capacidade * sizeof(char *));
+            if (!ficheiros) { perror("realloc"); exit(1); }
         }
 
-        // 10. Construir o caminho absoluto relativo ao diretorio permite ao worker abrir cada log corretamente.
+        /* Guardar o caminho completo: "directorio/ficheiro.log" */
         char caminho[512];
-        int escritos = snprintf(caminho, sizeof(caminho), "%s/%s", diretorio, nome);
-        if (escritos < 0 || (size_t)escritos >= sizeof(caminho)) {
-            posix_writef(STDERR_FILENO, "Caminho demasiado longo: %s/%s\n", diretorio, nome);
-            if (closedir(dir) == -1) {
-                perror("closedir");
-            }
-            libertar_ficheiros(ficheiros, total_ficheiros);
-            exit(1);
-        }
-
-        ficheiros[total_ficheiros] = strdup(caminho);
-        if (ficheiros[total_ficheiros] == NULL) {
-            perror("strdup");
-            if (closedir(dir) == -1) {
-                perror("closedir");
-            }
-            libertar_ficheiros(ficheiros, total_ficheiros);
-            exit(1);
-        }
-        total_ficheiros++;
+        snprintf(caminho, sizeof(caminho), "%s/%s", dir, nome);
+        ficheiros[total++] = strdup(caminho);
     }
 
-    // 11. readdir() usa NULL tanto para fim como para erro; errno distingue os dois casos.
-    if (errno != 0) {
-        perror("readdir");
-        if (closedir(dir) == -1) {
-            perror("closedir");
-        }
-        libertar_ficheiros(ficheiros, total_ficheiros);
-        exit(1);
-    }
-
-    if (closedir(dir) == -1) {
-        perror("closedir");
-        libertar_ficheiros(ficheiros, total_ficheiros);
-        exit(1);
-    }
-
-    *ficheiros_out = ficheiros;
-    *total_out = total_ficheiros;
+    closedir(d);
+    *total_out = total;
+    return ficheiros;
 }
 
-int main(int argc, char *argv[]) {
-    // 12. Validar argumentos antes de criar sockets ou processos evita recursos abertos em casos triviais de erro.
-    if (argc < 4) {
-        posix_writef(STDOUT_FILENO, "Uso: %s <diretorio> <num_processos> <modo> [--verbose] [--output=ficheiro.txt]\n",
-               argv[0]);
-        exit(1);
-    }
+/* Somar os resultados de um filho ao total geral */
+static void acumular(WorkerResult *total, WorkerResult *r, 
+                     char ip_list_global[256][IP_LEN], long ip_count_global[256], int *ip_num_global) {
+    total->total_lines    += r->total_lines;
+    total->count_debug    += r->count_debug;
+    total->count_info     += r->count_info;
+    total->count_warn     += r->count_warn;
+    total->count_error    += r->count_error;
+    total->count_critical += r->count_critical;
+    total->count_4xx      += r->count_4xx;
+    total->count_5xx      += r->count_5xx;
 
-    char *diretorio = argv[1];
-    int num_processos = converter_num_processos(argv[2]);
-    char *modo = argv[3];
-
-    int verbose = 0;
-    char *output_file = NULL;
-
-    // 13. Interpretar opcoes adicionais no pai define configuracao comum antes de criar workers.
-    for (int i = 4; i < argc; i++) {
-        if (strcmp(argv[i], "--verbose") == 0) {
-            verbose = 1;
-        } else if (strncmp(argv[i], "--output=", 9) == 0) {
-            output_file = argv[i] + 9;
+    /* Atualizar IP mais frequente GLOBALMENTE */
+    if (r->top_ip[0] != '-' && r->top_ip[0] != '\0') {
+        int found = -1;
+        for (int i = 0; i < *ip_num_global; i++) {
+            if (strcmp(ip_list_global[i], r->top_ip) == 0) {
+                found = i;
+                break;
+            }
+        }
+        
+        if (found == -1 && *ip_num_global < 256) {
+            /* IP novo, adicionar */
+            strncpy(ip_list_global[*ip_num_global], r->top_ip, IP_LEN - 1);
+            ip_count_global[*ip_num_global] = 1;
+            (*ip_num_global)++;
+        } else if (found >= 0) {
+            /* IP já existe, incrementar */
+            ip_count_global[found]++;
         }
     }
+    
+    /* Atualizar o top_ip do total com o IP mais frequente até agora */
+    long max_count = 0;
+    int top_idx = -1;
+    for (int i = 0; i < *ip_num_global; i++) {
+        if (ip_count_global[i] > max_count) {
+            max_count = ip_count_global[i];
+            top_idx = i;
+        }
+    }
+    if (top_idx >= 0)
+        strncpy(total->top_ip, ip_list_global[top_idx], IP_LEN - 1);
+}
 
-    // 14. Configurar o modo do parser antes do fork permite que os filhos herdem esta configuracao.
-    if (parser_set_mode_from_string(modo) != 0) {
-        posix_writef(STDERR_FILENO, "Modo invalido: %s (use security|performance|traffic|full)\n", modo);
+/* Imprimir o relatório final */
+static void imprimir_relatorio(WorkerResult *total, char *modo) {
+    printf("\n=== RELATORIO FINAL (%s) ===\n", modo);
+    printf("Total de linhas  : %ld\n", total->total_lines);
+    printf("DEBUG            : %ld\n", total->count_debug);
+    printf("INFO             : %ld\n", total->count_info);
+    printf("WARNINGS         : %ld\n", total->count_warn);
+    printf("ERRORS           : %ld\n", total->count_error);
+    printf("CRITICAL         : %ld\n", total->count_critical);
+    printf("HTTP 4xx         : %ld\n", total->count_4xx);
+    printf("HTTP 5xx         : %ld\n", total->count_5xx);
+    printf("IP mais frequente: %s\n",  total->top_ip[0] ? total->top_ip : "N/A");
+    printf("=================================\n");
+}
+
+/* ═════════════════════════════════════════════════════════════════════════════
+ * MAIN
+ * ════════════════════════════════════════════════════════════════════════════= */
+
+int main(int argc, char *argv[]) {
+
+    if (argc < 4) {
+        printf("Uso: %s <directorio> <num_processos> <modo> [--verbose]\n", argv[0]);
         exit(1);
     }
 
-    char **ficheiros = NULL;
-    int total_ficheiros = 0;
-    ler_diretorio_logs(diretorio, &ficheiros, &total_ficheiros);
+    char *dir          = argv[1];
+    int   num_procs    = atoi(argv[2]);
+    char *modo         = argv[3];
+    int   verbose      = (argc > 4 && strcmp(argv[4], "--verbose") == 0);
 
-    // 15. Sem ficheiros nao ha comunicacao: o programa termina antes de criar socket Unix ou filhos.
+    /* Configurar o modo do parser (security / traffic / full / ...) */
+    if (parser_set_mode_from_string(modo) != 0) {
+        fprintf(stderr, "Modo invalido: %s\n", modo);
+        exit(1);
+    }
+
+    /* ── 1. Descobrir os ficheiros de log ── */
+    int total_ficheiros = 0;
+    char **ficheiros = ler_directorio(dir, &total_ficheiros);
+
     if (total_ficheiros == 0) {
-        posix_writef(STDOUT_FILENO, "Nenhum ficheiro .log ou .json encontrado.\n");
-        libertar_ficheiros(ficheiros, total_ficheiros);
+        printf("Nenhum ficheiro .log ou .json encontrado em: %s\n", dir);
+        free(ficheiros);
         exit(0);
     }
 
-    if (num_processos > total_ficheiros) {
-        num_processos = total_ficheiros;
+    /* Não faz sentido ter mais processos do que ficheiros */
+    if (num_procs > total_ficheiros)
+        num_procs = total_ficheiros;
+
+    printf("Ficheiros encontrados: %d | Workers: %d | Modo: %s\n\n",
+           total_ficheiros, num_procs, modo);
+
+    /* ── 1.5 Contar TODAS as linhas UMA SÓ VEZ (antes do fork) ── */
+    printf("A contar linhas totais...\n");
+    long total_linhas = contar_todas_linhas(ficheiros, total_ficheiros);
+    printf("Total de linhas encontradas: %ld\n\n", total_linhas);
+    
+    /* Calcular configuração de cada worker antes do fork */
+    WorkerConfig *configs = malloc(num_procs * sizeof(WorkerConfig));
+    if (!configs) { perror("malloc"); exit(1); }
+    
+    long linhas_por_worker = total_linhas / num_procs;
+    for (int i = 0; i < num_procs; i++) {
+        configs[i].linha_inicio = i * linhas_por_worker;
+        configs[i].linha_fim = (i == num_procs - 1) ? total_linhas : configs[i].linha_inicio + linhas_por_worker;
+        configs[i].total_linhas_globais = total_linhas;
     }
 
-    // 16. O servidor cria o socket antes do fork para reservar SOCKET_PATH no file system e aceitar os filhos.
-    int server_fd = create_server_socket();
-    if (server_fd == -1) {
-        libertar_ficheiros(ficheiros, total_ficheiros);
+    /* ── 2. Criar o socket servidor (antes do fork, para os filhos herdarem o path) ── */
+    
+    /* Remover socket antigo se existir */
+    unlink(SOCKET_PATH);
+
+    /* Criar socket AF_UNIX do tipo SOCK_STREAM */
+    int server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (server_fd < 0) { perror("socket"); exit(1); }
+
+    /* Configurar o endereço */
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path) - 1);
+
+    /* Bind — associar o socket ao path */
+    if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("bind");
         exit(1);
     }
 
-    pid_t *pids = malloc((size_t)num_processos * sizeof(pid_t));
-    if (pids == NULL) {
-        perror("malloc");
-        if (close(server_fd) == -1) {
-            perror("close");
-        }
-        if (unlink(SOCKET_PATH) == -1) {
-            perror("unlink");
-        }
-        libertar_ficheiros(ficheiros, total_ficheiros);
+    /* Listen — aceitar até 64 ligações pendentes */
+    if (listen(server_fd, 64) < 0) {
+        perror("listen");
         exit(1);
     }
 
-    int ficheiros_por_processo = total_ficheiros / num_processos;
+    pid_t *pids = malloc(num_procs * sizeof(pid_t));
 
-    // 17. Esvaziar buffers stdio antes do fork evita que os filhos repitam texto ja impresso pelo pai.
-    if (fflush(NULL) == EOF) {
-        perror("fflush");
-        free(pids);
-        if (close(server_fd) == -1) {
-            perror("close");
-        }
-        if (unlink(SOCKET_PATH) == -1) {
-            perror("unlink");
-        }
-        libertar_ficheiros(ficheiros, total_ficheiros);
-        exit(1);
-    }
+    fflush(NULL); /* limpar buffers antes do fork para não duplicar output */
 
-    for (int i = 0; i < num_processos; i++) {
-        pid_t pid;
-
-        // 18. Criar cada worker com o padrao classico POSIX de fork() e verificar erro imediatamente.
-        if ((pid = fork()) == -1) {
-            perror("fork");
-            free(pids);
-            if (close(server_fd) == -1) {
-                perror("close");
-            }
-            if (unlink(SOCKET_PATH) == -1) {
-                perror("unlink");
-            }
-            libertar_ficheiros(ficheiros, total_ficheiros);
-            exit(1);
-        }
+    /* ── 3. Criar os filhos com fork() ── */
+    for (int i = 0; i < num_procs; i++) {
+        pid_t pid = fork();
+        if (pid < 0) { perror("fork"); exit(1); }
 
         if (pid == 0) {
-            // 19. O filho fecha o socket servidor herdado porque apenas precisa de se ligar como cliente.
             if (close(server_fd) == -1) {
                 perror("close");
                 exit(1);
             }
 
-            // 20. Cada filho recebe um intervalo disjunto de ficheiros para evitar trabalho duplicado.
-            int inicio = i * ficheiros_por_processo;
-            int fim = (i == num_processos - 1) ? total_ficheiros : inicio + ficheiros_por_processo;
-
-            run_worker(ficheiros, inicio, fim, i, verbose);
+            // O PAI AGORA PASSA TODOS OS FICHEIROS PARA TODOS OS FILHOS!
+            // A divisão vai ser feita por linhas lá dentro.
+            run_worker(ficheiros, total_ficheiros, num_procs, i, verbose);
             exit(0);
         }
 
         pids[i] = pid;
     }
 
-    int *client_fds = malloc((size_t)num_processos * sizeof(int));
-    if (client_fds == NULL) {
-        perror("malloc");
-        free(pids);
-        if (close(server_fd) == -1) {
-            perror("close");
+    /* ── 4. Aceitar as ligações dos filhos (uma por filho, usando select para não bloquear) ── */
+    int *client_fds = malloc(num_procs * sizeof(int));
+    for (int i = 0; i < num_procs; i++) client_fds[i] = -1;
+    
+    int num_conectados = 0;
+    
+    while (num_conectados < num_procs) {
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(server_fd, &readfds);
+        
+        struct timeval tv;
+        tv.tv_sec = 5;
+        tv.tv_usec = 0;
+        
+        int activity = select(server_fd + 1, &readfds, NULL, NULL, &tv);
+        if (activity < 0) { perror("select"); exit(1); }
+        
+        if (activity == 0) {
+            fprintf(stderr, "Timeout: aguardando conexão de worker\n");
+            continue;
         }
-        if (unlink(SOCKET_PATH) == -1) {
-            perror("unlink");
-        }
-        libertar_ficheiros(ficheiros, total_ficheiros);
-        exit(1);
-    }
-
-    // 21. O pai aceita uma ligacao Unix Domain Socket por worker usando accept_client(), como servidor POSIX.
-    for (int i = 0; i < num_processos; i++) {
-        client_fds[i] = accept_client(server_fd);
-        if (client_fds[i] == -1) {
-            free(client_fds);
-            free(pids);
-            if (close(server_fd) == -1) {
-                perror("close");
+        
+        if (FD_ISSET(server_fd, &readfds)) {
+            /* Aceitar ligação de um cliente */
+            int client_fd = accept(server_fd, NULL, NULL);
+            if (client_fd < 0) { perror("accept"); exit(1); }
+            
+            /* Encontrar um slot vazio para este worker */
+            /* Nota: não é por ordem, pode ser qualquer um */
+            int idx = -1;
+            for (int i = 0; i < num_procs; i++) {
+                if (client_fds[i] == -1) {
+                    idx = i;
+                    break;
+                }
             }
-            if (unlink(SOCKET_PATH) == -1) {
-                perror("unlink");
+            
+            if (idx >= 0) {
+                client_fds[idx] = client_fd;
+                
+                /* Enviar configuração ao worker */
+                int tipo = MSG_CONFIG;
+                write(client_fds[idx], &tipo, sizeof(tipo));
+                write(client_fds[idx], &configs[idx], sizeof(WorkerConfig));
+                
+                num_conectados++;
+                if (verbose)
+                    printf("Worker %d conectado (total: %d/%d)\n", idx, num_conectados, num_procs);
             }
-            libertar_ficheiros(ficheiros, total_ficheiros);
-            exit(1);
         }
     }
 
-    WorkerResult total = {0};
-    int resultados_recebidos = 0;
-    ProgressUpdate *progressos = calloc((size_t)num_processos, sizeof(ProgressUpdate));
-    if (progressos == NULL) {
-        perror("calloc");
-        free(client_fds);
-        free(pids);
-        if (close(server_fd) == -1) {
-            perror("close");
-        }
-        if (unlink(SOCKET_PATH) == -1) {
-            perror("unlink");
-        }
-        libertar_ficheiros(ficheiros, total_ficheiros);
-        exit(1);
-    }
-
-    for (int i = 0; i < num_processos; i++) {
-        progressos[i].pid = pids[i];
+    /* ── 5. Reservar espaço no terminal para o dashboard ── */
+    ProgressUpdate *progressos = calloc(num_procs, sizeof(ProgressUpdate));
+    for (int i = 0; i < num_procs; i++) {
         progressos[i].worker_index = i;
-        progressos[i].lines_done = 0;
-        progressos[i].lines_total = 0;
+        printf("Worker %2d [....................] -- Aguardar...\n", i);
     }
+    fflush(stdout);
 
-    time_t ultimo_refresh_dashboard = 0;
-    if (verbose) {
-        atualizar_dashboard_se_preciso(progressos, num_processos, &ultimo_refresh_dashboard);
-    }
+    /* ── 6. Loop principal: receber mensagens dos filhos (com select, sem busy-waiting) ── */
+    char ip_list_global[256][IP_LEN];
+    long ip_count_global[256] = {0};
+    int ip_num_global = 0;
+    
+    WorkerResult total = {0};
+    int resultados = 0;
 
-    // 22. Ler mensagens dos clientes; cada WorkerResult e recebido com readn() para evitar leituras parciais.
-    while (resultados_recebidos < num_processos) {
-        for (int i = 0; i < num_processos; i++) {
-            if (client_fds[i] == -1) {
+    while (resultados < num_procs) {
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        
+        /* Adicionar todos os client_fds ao set para monitorar */
+        int max_fd = -1;
+        for (int i = 0; i < num_procs; i++) {
+            if (client_fds[i] != -1) {
+                FD_SET(client_fds[i], &readfds);
+                if (client_fds[i] > max_fd) max_fd = client_fds[i];
+            }
+        }
+        
+        /* Esperar por actividade com timeout de 1 segundo */
+        struct timeval tv;
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+        
+        int activity = select(max_fd + 1, &readfds, NULL, NULL, &tv);
+        if (activity < 0) { perror("select"); exit(1); }
+        
+        if (activity == 0) continue; /* Timeout, tenta novamente */
+        
+        /* Verificar qual(ais) socket(s) têm dados disponíveis */
+        for (int i = 0; i < num_procs; i++) {
+            if (client_fds[i] == -1 || !FD_ISSET(client_fds[i], &readfds)) 
+                continue;
+
+            /* Ler o tipo da mensagem */
+            int tipo;
+            ssize_t lidos = read(client_fds[i], &tipo, sizeof(tipo));
+            if (lidos <= 0) {
+                /* Filho fechou o socket inesperadamente */
+                fprintf(stderr, "Worker %d: ligação fechada inesperadamente\n", i);
+                close(client_fds[i]);
+                client_fds[i] = -1;
+                resultados++;
                 continue;
             }
 
-            MsgHeader hdr;
-            ssize_t lidos = readn(client_fds[i], &hdr, sizeof(hdr));
-            if (lidos == -1) {
-                perror("readn");
-                exit(1);
-            }
-            if (lidos == 0) {
-                posix_writef(STDERR_FILENO, "Erro: worker fechou socket antes de enviar resultado\n");
-                exit(1);
-            }
-            if (lidos != (ssize_t)sizeof(hdr)) {
-                posix_writef(STDERR_FILENO, "Erro: cabecalho incompleto recebido do worker\n");
-                exit(1);
-            }
+            if (tipo == MSG_PROGRESSO) {
+                /* Receber e actualizar progresso */
+                ProgressUpdate pu;
+                read(client_fds[i], &pu, sizeof(pu));
+                progressos[pu.worker_index] = pu;
+                desenhar_dashboard(progressos, num_procs);
 
-            if (hdr.type == MSG_PROGRESS) {
-                // 23. ProgressUpdate tambem e lido com readn(), mantendo alinhamento correto do stream.
-                ProgressUpdate progresso;
-                lidos = readn(client_fds[i], &progresso, sizeof(progresso));
-                if (lidos == -1) {
-                    perror("readn");
-                    exit(1);
-                }
-                if (lidos != (ssize_t)sizeof(progresso)) {
-                    posix_writef(STDERR_FILENO, "Erro: progresso incompleto recebido do worker\n");
-                    exit(1);
-                }
-                if (progresso.worker_index >= 0 && progresso.worker_index < num_processos) {
-                    progressos[progresso.worker_index] = progresso;
-                }
-                if (verbose) {
-                    atualizar_dashboard_se_preciso(progressos, num_processos,
-                                                   &ultimo_refresh_dashboard);
-                }
-            } else if (hdr.type == MSG_RESULT) {
-                // 24. A estrutura WorkerResult contem o resumo final e e lida obrigatoriamente com readn().
+            } else if (tipo == MSG_RESULTADO) {
+                /* Receber resultado e acumular */
                 WorkerResult r;
-                lidos = readn(client_fds[i], &r, sizeof(r));
-                if (lidos == -1) {
-                    perror("readn");
-                    exit(1);
-                }
-                if (lidos != (ssize_t)sizeof(r)) {
-                    posix_writef(STDERR_FILENO, "Erro: WorkerResult incompleto recebido do worker\n");
-                    exit(1);
-                }
+                read(client_fds[i], &r, sizeof(r));
+                acumular(&total, &r, (char (*)[IP_LEN])ip_list_global, ip_count_global, &ip_num_global);
 
-                acumular_resultado(&total, &r);
-                resultados_recebidos++;
-                for (int j = 0; j < num_processos; j++) {
-                    if (progressos[j].pid == r.pid) {
-                        progressos[j].lines_done = progressos[j].lines_total;
-                        break;
-                    }
-                }
+                /* Marcar este worker como 100% terminado */
+                progressos[i].lines_done = progressos[i].lines_total;
+                desenhar_dashboard(progressos, num_procs);
 
-                // 25. Depois do resultado final, o pai fecha o socket cliente porque ja recebeu tudo desse worker.
-                if (close(client_fds[i]) == -1) {
-                    perror("close");
-                    exit(1);
-                }
+                close(client_fds[i]);
                 client_fds[i] = -1;
-            } else {
-                posix_writef(STDERR_FILENO, "Erro: tipo de mensagem desconhecido: %d\n", hdr.type);
-                exit(1);
+                resultados++;
             }
         }
     }
 
-    if (verbose) {
-        time_t agora = time(NULL);
-        if (agora != (time_t)-1 && ultimo_refresh_dashboard != 0 &&
-            difftime(agora, ultimo_refresh_dashboard) < 1.0) {
-            sleep(1);
-        }
-        desenhar_dashboard(progressos, num_processos);
-        posix_writef(STDOUT_FILENO, "\n");
-    }
+    /* ── 7. Fechar o socket servidor e remover o ficheiro do socket ── */
+    close(server_fd);
+    unlink(SOCKET_PATH);
 
-    // 26. Fechar o socket servidor impede novas ligacoes depois de todos os resultados terem chegado.
-    if (close(server_fd) == -1) {
-        perror("close");
-        exit(1);
-    }
-
-    // 27. Remover SOCKET_PATH no final limpa o ficheiro especial criado pelo Unix Domain Socket.
-    if (unlink(SOCKET_PATH) == -1) {
-        perror("unlink");
-        exit(1);
-    }
-
-    // 28. O pai recolhe explicitamente cada worker e interpreta o estado com macros POSIX.
-    for (int i = 0; i < num_processos; i++) {
+    /* ── 8. Esperar que todos os filhos terminem (recolher zombies) ── */
+    for (int i = 0; i < num_procs; i++) {
         int status;
-        if (waitpid(pids[i], &status, 0) == -1) {
-            perror("waitpid");
-            exit(1);
-        }
-
-        if (WIFEXITED(status)) {
-            int codigo = WEXITSTATUS(status);
-            if (codigo != 0) {
-                posix_writef(STDERR_FILENO, "[PAI] Filho %d terminou com codigo %d\n", pids[i], codigo);
-                exit(1);
-            }
-        } else {
-            posix_writef(STDERR_FILENO, "[PAI] Filho %d nao terminou por exit normal\n", pids[i]);
-            exit(1);
-        }
+        waitpid(pids[i], &status, 0);
+        if (WIFEXITED(status) && WEXITSTATUS(status) != 0)
+            fprintf(stderr, "Worker %d terminou com erro %d\n", i, WEXITSTATUS(status));
     }
 
-    gerar_relatorio(total, modo, output_file);
+    /* ── 9. Relatório final ── */
+    imprimir_relatorio(&total, modo);
 
-    // 29. Libertar memoria do pai apos fechar sockets e recolher filhos conclui a limpeza do processo principal.
     free(progressos);
     free(client_fds);
     free(pids);
+    free(configs);
     libertar_ficheiros(ficheiros, total_ficheiros);
 
-    exit(0);
+    return 0;
 }

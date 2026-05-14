@@ -12,6 +12,22 @@
 #define SOCKET_PATH "/tmp/loganalyzer.sock"
 
 /* =========================================================
+ * Tipos de mensagens (protocol)
+ * ========================================================= */
+#define MSG_CONFIG     0  /* Pai envia configuração ao worker */
+#define MSG_PROGRESSO  1  /* Worker envia progresso ao pai */
+#define MSG_RESULTADO  2  /* Worker envia resultado final ao pai */
+
+/* =========================================================
+ * Estrutura enviada do pai para o filho — configuração
+ * ========================================================= */
+typedef struct {
+    long linha_inicio;
+    long linha_fim;
+    long total_linhas_globais;
+} WorkerConfig;
+
+/* =========================================================
  * Estrutura enviada do filho para o pai — resultados finais
  * ========================================================= */
 typedef struct {
@@ -38,27 +54,15 @@ typedef struct {
 } ProgressUpdate;
 
 /* =========================================================
-
  * Funções de Unix Domain Sockets
  * ========================================================= */
-
-/**
- * Cria o socket servidor, faz bind() e listen().
- * Retorna o fd do socket servidor, ou -1 em erro.
- */
-int create_server_socket(void);
-
-/**
- * Aceita uma ligação de um cliente.
- * Retorna o fd do cliente aceite, ou -1 em erro.
- */
-int accept_client(int server_fd);
 
 /**
  * Liga ao socket servidor (usado pelos filhos).
  * Retorna o fd do socket ligado, ou -1 em erro.
  */
 int connect_to_server(void);
+
 /* =========================================================
  * Funções auxiliares seguras para Pipes/Sockets
  *
