@@ -154,38 +154,57 @@ static void acumular(WorkerResult *total, WorkerResult *r,
     total->count_4xx      += r->count_4xx;
     total->count_5xx      += r->count_5xx;
 
-    /* Atualizar IP mais frequente GLOBALMENTE */
-    if (r->top_ip[0] != '-' && r->top_ip[0] != '\0') {
+    /* Atualizar Top 10 IPs globalmente a partir do Top 10 de cada worker */
+    for (int k = 0; k < 10; k++) {
+        if (r->top_ips[k][0] == '\0' || r->top_ips_counts[k] <= 0) continue;
+
         int found = -1;
         for (int i = 0; i < *ip_num_global; i++) {
-            if (strcmp(ip_list_global[i], r->top_ip) == 0) {
+            if (strcmp(ip_list_global[i], r->top_ips[k]) == 0) {
                 found = i;
                 break;
             }
         }
         
         if (found == -1 && *ip_num_global < 256) {
-            /* IP novo, adicionar */
-            strncpy(ip_list_global[*ip_num_global], r->top_ip, IP_LEN - 1);
-            ip_count_global[*ip_num_global] = 1;
+            strncpy(ip_list_global[*ip_num_global], r->top_ips[k], IP_LEN - 1);
+            ip_list_global[*ip_num_global][IP_LEN - 1] = '\0';
+            ip_count_global[*ip_num_global] = r->top_ips_counts[k];
             (*ip_num_global)++;
         } else if (found >= 0) {
-            /* IP já existe, incrementar */
-            ip_count_global[found]++;
+            ip_count_global[found] += r->top_ips_counts[k];
         }
+    }
+
+    for (int i = 0; i < r->num_alerts && total->num_alerts < MAX_ALERTS; i++) {
+        strncpy(total->alerts[total->num_alerts], r->alerts[i], ALERT_LEN - 1);
+        total->alerts[total->num_alerts][ALERT_LEN - 1] = '\0';
+        total->num_alerts++;
     }
     
-    /* Atualizar o top_ip do total com o IP mais frequente até agora */
-    long max_count = 0;
-    int top_idx = -1;
-    for (int i = 0; i < *ip_num_global; i++) {
-        if (ip_count_global[i] > max_count) {
-            max_count = ip_count_global[i];
-            top_idx = i;
+    for (int i = 0; i < *ip_num_global - 1; i++) {
+        for (int j = 0; j < *ip_num_global - i - 1; j++) {
+            if (ip_count_global[j] < ip_count_global[j + 1]) {
+                long tmp_count = ip_count_global[j];
+                ip_count_global[j] = ip_count_global[j + 1];
+                ip_count_global[j + 1] = tmp_count;
+
+                char tmp_ip[IP_LEN];
+                strncpy(tmp_ip, ip_list_global[j], IP_LEN);
+                strncpy(ip_list_global[j], ip_list_global[j + 1], IP_LEN);
+                strncpy(ip_list_global[j + 1], tmp_ip, IP_LEN);
+            }
         }
     }
-    if (top_idx >= 0)
-        strncpy(total->top_ip, ip_list_global[top_idx], IP_LEN - 1);
+
+    memset(total->top_ips, 0, sizeof(total->top_ips));
+    memset(total->top_ips_counts, 0, sizeof(total->top_ips_counts));
+    int limite = *ip_num_global < 10 ? *ip_num_global : 10;
+    for (int i = 0; i < limite; i++) {
+        strncpy(total->top_ips[i], ip_list_global[i], IP_LEN - 1);
+        total->top_ips[i][IP_LEN - 1] = '\0';
+        total->top_ips_counts[i] = ip_count_global[i];
+    }
 }
 
 /* Imprimir o relatório final */
@@ -199,7 +218,20 @@ static void imprimir_relatorio(WorkerResult *total, char *modo) {
     printf("CRITICAL         : %ld\n", total->count_critical);
     printf("HTTP 4xx         : %ld\n", total->count_4xx);
     printf("HTTP 5xx         : %ld\n", total->count_5xx);
-    printf("IP mais frequente: %s\n",  total->top_ip[0] ? total->top_ip : "N/A");
+    printf("\n--- TOP 10 IPs ---\n");
+    for (int i = 0; i < 10; i++) {
+        if (total->top_ips[i][0] == '\0' || total->top_ips_counts[i] <= 0) break;
+        printf("%2d. %s (%ld pedidos)\n", i + 1, total->top_ips[i], total->top_ips_counts[i]);
+    }
+
+    printf("\n--- ALERTAS CRITICOS ---\n");
+    if (total->num_alerts == 0) {
+        printf("Sem alertas criticos.\n");
+    } else {
+        for (int i = 0; i < total->num_alerts; i++) {
+            printf("%2d. %s\n", i + 1, total->alerts[i]);
+        }
+    }
     printf("=================================\n");
 }
 
