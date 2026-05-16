@@ -28,30 +28,64 @@ static void enviar_progresso(int pipe_fd, int worker_index, long feitas, long to
     write(pipe_fd, &pu, sizeof(pu));
 }
 
+static void preparar_resultado(const Metrics *m, WorkerResult *r) {
+    memset(r, 0, sizeof(*r));
+    r->pid            = getpid();
+    r->total_lines    = m->total_lines;
+    r->count_debug    = m->count_debug;
+    r->count_info     = m->count_info;
+    r->count_warn     = m->count_warn;
+    r->count_error    = m->count_error;
+    r->count_critical = m->count_critical;
+    r->count_4xx      = m->count_4xx;
+    r->count_5xx      = m->count_5xx;
+
+    char ips[MAX_IPS][IP_LEN];
+    long counts[MAX_IPS];
+    int n = m->ip_num;
+    if (n > MAX_IPS) n = MAX_IPS;
+
+    for (int i = 0; i < n; i++) {
+        strncpy(ips[i], m->ip_list[i], IP_LEN - 1);
+        ips[i][IP_LEN - 1] = '\0';
+        counts[i] = m->ip_count[i];
+    }
+
+    for (int i = 0; i < n - 1; i++) {
+        for (int j = 0; j < n - i - 1; j++) {
+            if (counts[j] < counts[j + 1]) {
+                long tmp_count = counts[j];
+                counts[j] = counts[j + 1];
+                counts[j + 1] = tmp_count;
+
+                char tmp_ip[IP_LEN];
+                strncpy(tmp_ip, ips[j], IP_LEN);
+                strncpy(ips[j], ips[j + 1], IP_LEN);
+                strncpy(ips[j + 1], tmp_ip, IP_LEN);
+            }
+        }
+    }
+
+    int limite = n < 10 ? n : 10;
+    for (int i = 0; i < limite; i++) {
+        strncpy(r->top_ips[i], ips[i], IP_LEN - 1);
+        r->top_ips[i][IP_LEN - 1] = '\0';
+        r->top_ips_counts[i] = counts[i];
+    }
+
+    r->num_alerts = m->num_alerts < MAX_ALERTS ? m->num_alerts : MAX_ALERTS;
+    for (int i = 0; i < r->num_alerts; i++) {
+        strncpy(r->alerts[i], m->alerts[i], ALERT_LEN - 1);
+        r->alerts[i][ALERT_LEN - 1] = '\0';
+    }
+}
+
 static void enviar_resultado(int pipe_fd, Metrics *m) {
     int tipo = MSG_RESULTADO;
     write(pipe_fd, &tipo, sizeof(tipo));
 
     WorkerResult r;
-    r.pid            = getpid();
-    r.total_lines    = m->total_lines;
-    r.count_debug    = m->count_debug;
-    r.count_info     = m->count_info;
-    r.count_warn     = m->count_warn;
-    r.count_error    = m->count_error;
-    r.count_critical = m->count_critical;
-    r.count_4xx      = m->count_4xx;
-    r.count_5xx      = m->count_5xx;
-
-    strncpy(r.top_ip, "-", IP_LEN - 1);
-    long top = 0;
-    for (int i = 0; i < m->ip_num; i++) {
-        if (m->ip_count[i] > top) {
-            top = m->ip_count[i];
-            strncpy(r.top_ip, m->ip_list[i], IP_LEN - 1);
-        }
-    }
-    r.top_ip[IP_LEN - 1] = '\0';
+    preparar_resultado(m, &r);
     write(pipe_fd, &r, sizeof(r));
 }
 

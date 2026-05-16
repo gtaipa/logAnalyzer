@@ -40,7 +40,10 @@ typedef struct {
     long count_critical;
     long count_4xx;
     long count_5xx;
-    char top_ip[IP_LEN];
+    char top_ips[10][IP_LEN];
+    long top_ips_counts[10];
+    char alerts[MAX_ALERTS][ALERT_LEN];
+    int num_alerts;
 } WorkerResult;
 
 /* =========================================================

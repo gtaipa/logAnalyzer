@@ -35,6 +35,8 @@ typedef enum {
  * --------------------------------------------------------- */
 #define IP_LEN      16   /* "255.255.255.255\0" */
 #define MSG_LEN    256
+#define MAX_ALERTS 20
+#define ALERT_LEN  128
 
 typedef struct {
     LogFormat format;
@@ -63,6 +65,10 @@ typedef struct {
     char ip_list[MAX_IPS][IP_LEN];
     long ip_count[MAX_IPS];
     int  ip_num;        /* quantos IPs distintos encontrámos até agora */
+
+    /* Alertas críticos/alta severidade guardados por worker */
+    char alerts[MAX_ALERTS][ALERT_LEN];
+    int  num_alerts;
 } Metrics;
 
 /* ---------------------------------------------------------

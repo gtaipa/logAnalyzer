@@ -33,6 +33,14 @@ static LogLevel level_from_json_level(int json_level) {
     }
 }
 
+static void copy_description_or_fallback(LogEntry *entry, const char *description, const char *fallback) {
+    const char *text = (description && description[0] != '\0') ? description : fallback;
+    if (text == NULL || text[0] == '\0') text = "Evento critico sem descricao";
+
+    strncpy(entry->message, text, MSG_LEN - 1);
+    entry->message[MSG_LEN - 1] = '\0';
+}
+
 static int extract_ipv4(const char *s, char out[IP_LEN]) {
     if (!s) return -1;
     out[0] = '\0';
@@ -176,8 +184,7 @@ int parse_line(const char *line, LogFormat format, LogEntry *entry) {
             entry->http_status = a.status_code;
             strncpy(entry->ip, a.ip, IP_LEN - 1);
             entry->ip[IP_LEN - 1] = '\0';
-            strncpy(entry->message, a.url, MSG_LEN - 1);
-            entry->message[MSG_LEN - 1] = '\0';
+            copy_description_or_fallback(entry, event.description, a.url);
             return 0;
         }
         case FORMAT_JSON: {
@@ -189,8 +196,7 @@ int parse_line(const char *line, LogFormat format, LogEntry *entry) {
             entry->level = level_from_json_level(j.level);
             strncpy(entry->ip, j.ip, IP_LEN - 1);
             entry->ip[IP_LEN - 1] = '\0';
-            strncpy(entry->message, j.message, MSG_LEN - 1);
-            entry->message[MSG_LEN - 1] = '\0';
+            copy_description_or_fallback(entry, event.description, j.message);
             return 0;
         }
         case FORMAT_SYSLOG: {
@@ -201,8 +207,7 @@ int parse_line(const char *line, LogFormat format, LogEntry *entry) {
 
             entry->level = level_from_severity(event.severity);
             (void)extract_ipv4(s.message, entry->ip);
-            strncpy(entry->message, s.message, MSG_LEN - 1);
-            entry->message[MSG_LEN - 1] = '\0';
+            copy_description_or_fallback(entry, event.description, s.message);
             return 0;
         }
         case FORMAT_NGINX_ERROR: {
@@ -214,8 +219,7 @@ int parse_line(const char *line, LogFormat format, LogEntry *entry) {
             entry->level = level_from_severity(event.severity);
             strncpy(entry->ip, n.client_ip, IP_LEN - 1);
             entry->ip[IP_LEN - 1] = '\0';
-            strncpy(entry->message, n.message, MSG_LEN - 1);
-            entry->message[MSG_LEN - 1] = '\0';
+            copy_description_or_fallback(entry, event.description, n.message);
             return 0;
         }
         default:
@@ -237,6 +241,13 @@ void update_metrics(Metrics *m, const LogEntry *e) {
 
     if (e->http_status >= 500) m->count_5xx++;
     else if (e->http_status >= 400) m->count_4xx++;
+
+    if ((e->level == LEVEL_ERROR || e->level == LEVEL_CRITICAL) && m->num_alerts < MAX_ALERTS) {
+        const char *alert = e->message[0] != '\0' ? e->message : "Evento critico sem descricao";
+        strncpy(m->alerts[m->num_alerts], alert, ALERT_LEN - 1);
+        m->alerts[m->num_alerts][ALERT_LEN - 1] = '\0';
+        m->num_alerts++;
+    }
 
     if (e->ip[0] != '\0') {
         int found = 0;
