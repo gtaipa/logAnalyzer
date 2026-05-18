@@ -1,47 +1,36 @@
 #ifndef WORKER_PRODCONS_H
 #define WORKER_PRODCONS_H
 
-#include <pthread.h>
 #include <semaphore.h>
-#include "parser.h"
+#include <pthread.h>
 
-#define BUFFER_SIZE 100
-#define ALERT_BUFFER_SIZE 32
+#define BUFFER_SIZE 10
 
-extern char *ficheiros[];
-extern int total_ficheiros;
-extern int num_produtores;
-extern int verbose;
+// 1. A unidade básica de dados 📦
+typedef struct {
+    int log_type;
+    char text_line[256];
+} LogEntry;
 
-extern LogEntry buffer[BUFFER_SIZE];
-extern int prodptr;
-extern int consptr;
-extern int buffer_count;
-extern int produtores_ativos;
+// 2. A estrutura de controlo do Buffer Circular 
+typedef struct {
+    LogEntry queue[BUFFER_SIZE]; 
+    int count;   // Número atual de itens
+    int in;      // Índice para o Produtor (entrada)
+    int out;     // Índice para o Consumidor (saída)
+    pthread_mutex_t mutex; 
+    sem_t empty; // Conta as vagas (espaços livres)
+    sem_t full;  // Conta os itens (mensagens prontas)
+} LogQueue;
 
-extern Metrics global_metrics;
-extern pthread_mutex_t trinco;
-extern pthread_mutex_t metrics_mutex;
-extern sem_t vagas;
-extern sem_t itens;
+// 3. Declaração do buffer como externo 
+// Isto diz ao compilador que a variável 'buffer' existe, 
+// mas será criada num ficheiro .c (normalmente no main.c)
+extern LogQueue buffer;
 
-extern LogEntry alert_buffer[ALERT_BUFFER_SIZE];
-extern int alert_prodptr;
-extern int alert_consptr;
-extern int alert_count;
-extern pthread_mutex_t alert_trinco;
-extern sem_t alert_vagas;
-extern sem_t alert_itens;
-extern volatile int consumidores_ativos;
+// 4. Assinaturas das funções (os "contratos") 
 
-void init_bounded_buffer(void);
-void destroy_bounded_buffer(void);
-void init_alert_buffer(void);
-void destroy_alert_buffer(void);
-void send_alert(LogEntry *entry);
+void* producer_routine(void* arg);
+void* consumer_routine(void* arg);
 
-void *run_producer(void *arg);
-void *run_consumer(void *arg);
-void *run_alert_monitor(void *arg);
-
-#endif /* WORKER_PRODCONS_H */
+#endif
