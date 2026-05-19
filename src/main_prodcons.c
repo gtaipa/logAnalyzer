@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <pthread.h>
 #include <time.h>
 #include <sys/types.h>
@@ -7,15 +8,16 @@
 #include <unistd.h>
 #include <semaphore.h>
 #include "worker_prodcons.h"
-#define BUFFER_SIZE 10  
-
-
-LogQueue buffer;
+#define BUFFER_SIZE 10 
 
 int main(){
 pthread_mutex_init(&(buffer.mutex), NULL);
 sem_init(&(buffer.empty), 0, BUFFER_SIZE);
 sem_init(&(buffer.full), 0, 0);
+
+    // Initialize indices
+    buffer.in = 0;
+    buffer.out = 0;
 
 }
 void *producer(void *arg) {
@@ -30,11 +32,11 @@ void *producer(void *arg) {
         sem_wait(&(buffer.empty)); // Espera por espaço vazio
         pthread_mutex_lock(&(buffer.mutex)); // Tranca a porta
         
-        line_size = read(fd, buffer.Queue[buffer.in].text_line, BUFFER_SIZE);
+        line_size = read(fd, buffer.queue[buffer.in].message, MSG_LEN - 1);
         
         // Se o ficheiro acabou, enviamos a pílula venenosa!
         if (line_size == 0) {
-            buffer.Queue[buffer.in].text_line[0] = '\0'; // Sinal de fim
+            buffer.queue[buffer.in].message[0] = '\0'; // Sinal de fim
             buffer.in = (buffer.in + 1) % BUFFER_SIZE;
             pthread_mutex_unlock(&(buffer.mutex));
             sem_post(&(buffer.full)); // Avisa o consumidor!
@@ -42,7 +44,7 @@ void *producer(void *arg) {
         }
         
         // Se não acabou, preenche normalmente
-        buffer.Queue[buffer.in].text_line[line_size] = '\0';
+        buffer.queue[buffer.in].message[line_size] = '\0';
         buffer.in = (buffer.in + 1) % BUFFER_SIZE;
         
         pthread_mutex_unlock(&(buffer.mutex)); // Destranca a porta
@@ -65,7 +67,7 @@ void* consumer_routine(void* arg) {
         pthread_mutex_lock(&(buffer.mutex)); // Tranca a porta
 
         // 1. Verifica se é a pílula venenosa
-        if (buffer.Queue[buffer.out].text_line[0] == '\0') {
+        if (buffer.queue[buffer.out].message[0] == '\0') {
             buffer.out = (buffer.out + 1) % BUFFER_SIZE;
             pthread_mutex_unlock(&(buffer.mutex));
             sem_post(&(buffer.empty)); // CORREÇÃO: Avisa que há um espaço VAZIO
@@ -73,7 +75,7 @@ void* consumer_routine(void* arg) {
         }
 
         // 2. Se não for, copia a linha para o ficheiro
-        write(fd2, buffer.Queue[buffer.out].text_line, strlen(buffer.Queue[buffer.out].text_line));
+        write(fd2, buffer.queue[buffer.out].message, strlen(buffer.queue[buffer.out].message));
        
         // 3. Avança o índice
         buffer.out = (buffer.out + 1) % BUFFER_SIZE;

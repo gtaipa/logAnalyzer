@@ -1,327 +1,243 @@
-#include "worker_prodcons.h"
+#include "ipc.h"
 #include "parser.h"
 #include "posix_io.h"
+#include "worker.h"
+#include "worker_prodcons.h"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <fcntl.h>
-#include <pthread.h>
-#include <semaphore.h>
-#include <errno.h>
-#include <ctype.h>
-#include <time.h>
 
 #define BUF_SIZE 4096
-#define LINE_MAX 512
+#define LINE_MAX_LOCAL 512
 
-LogEntry alert_buffer[ALERT_BUFFER_SIZE];
-int alert_prodptr = 0;
-int alert_consptr = 0;
-int alert_count = 0;
-pthread_mutex_t alert_trinco;
-sem_t alert_vagas;
-sem_t alert_itens;
-volatile int consumidores_ativos = 1;
+#define MSG_PROGRESSO 1
+#define MSG_RESULTADO 2
 
-static void esperar(sem_t *sem) {
-    while (sem_wait(sem) == -1) {
-        if (errno != EINTR) {
-            perror("sem_wait");
-            pthread_exit(NULL);
-        }
+#define BUFFER_SLOTS 10
+#define LINE_SIZE 512
+
+static void esperar(sem_t *s) {
+    while (sem_wait(s) == -1 && errno == EINTR) {
     }
 }
 
-static void assinalar(sem_t *sem) {
-    if (sem_post(sem) == -1) {
-        perror("sem_post");
-        pthread_exit(NULL);
-    }
+static void assinalar(sem_t *s) {
+    sem_post(s);
 }
 
-void init_bounded_buffer(void) {
-    prodptr = 0;
-    consptr = 0;
-    buffer_count = 0;
-    produtores_ativos = 1;
+static void enviar_progresso(int pipe_fd, int worker_index, long feitas, long total) {
+    int tipo = MSG_PROGRESSO;
+    write(pipe_fd, &tipo, sizeof(tipo));
 
-    pthread_mutex_init(&trinco, NULL);
-    pthread_mutex_init(&metrics_mutex, NULL);
-    sem_init(&vagas, 0, BUFFER_SIZE);
-    sem_init(&itens, 0, 0);
+    ProgressUpdate pu;
+    pu.pid          = getpid();
+    pu.worker_index = worker_index;
+    pu.lines_done   = feitas;
+    pu.lines_total  = total;   
+    write(pipe_fd, &pu, sizeof(pu));
 }
 
-void destroy_bounded_buffer(void) {
-    pthread_mutex_destroy(&trinco);
-    pthread_mutex_destroy(&metrics_mutex);
-    sem_destroy(&vagas);
-    sem_destroy(&itens);
-}
+static void preparar_resultado(const Metrics *m, WorkerResult *r) {
+    memset(r, 0, sizeof(*r));
+    r->pid            = getpid();
+    r->total_lines    = m->total_lines;
+    r->count_debug    = m->count_debug;
+    r->count_info     = m->count_info;
+    r->count_warn     = m->count_warn;
+    r->count_error    = m->count_error;
+    r->count_critical = m->count_critical;
+    r->count_4xx      = m->count_4xx;
+    r->count_5xx      = m->count_5xx;
 
-void init_alert_buffer(void) {
-    alert_prodptr = 0;
-    alert_consptr = 0;
-    alert_count = 0;
-    consumidores_ativos = 1;
+    char ips[MAX_IPS][IP_LEN];
+    long counts[MAX_IPS];
+    int n = m->ip_num;
+    if (n > MAX_IPS) n = MAX_IPS;
 
-    pthread_mutex_init(&alert_trinco, NULL);
-    sem_init(&alert_vagas, 0, ALERT_BUFFER_SIZE);
-    sem_init(&alert_itens, 0, 0);
-}
-
-void destroy_alert_buffer(void) {
-    pthread_mutex_destroy(&alert_trinco);
-    sem_destroy(&alert_vagas);
-    sem_destroy(&alert_itens);
-}
-
-static const char *level_to_string(LogLevel level) {
-    switch (level) {
-        case LEVEL_DEBUG: return "DEBUG";
-        case LEVEL_INFO: return "INFO";
-        case LEVEL_WARN: return "WARN";
-        case LEVEL_ERROR: return "ERROR";
-        case LEVEL_CRITICAL: return "CRITICAL";
-        default: return "UNKNOWN";
-    }
-}
-
-static int contains_case_insensitive(const char *text, const char *needle) {
-    size_t needle_len = strlen(needle);
-
-    if (needle_len == 0) return 1;
-
-    for (const char *p = text; *p; p++) {
-        size_t i = 0;
-        while (needle[i] &&
-               p[i] &&
-               tolower((unsigned char)p[i]) == tolower((unsigned char)needle[i])) {
-            i++;
-        }
-        if (i == needle_len) return 1;
+    for (int i = 0; i < n; i++) {
+        strncpy(ips[i], m->ip_list[i], IP_LEN - 1);
+        ips[i][IP_LEN - 1] = '\0';
+        counts[i] = m->ip_count[i];
     }
 
-    return 0;
-}
+    for (int i = 0; i < n - 1; i++) {
+        for (int j = 0; j < n - i - 1; j++) {
+            if (counts[j] < counts[j + 1]) {
+                long tmp_count = counts[j];
+                counts[j] = counts[j + 1];
+                counts[j + 1] = tmp_count;
 
-static int is_sql_injection(const LogEntry *entry) {
-    const char *msg = entry->message;
-
-    return contains_case_insensitive(msg, "sql injection") ||
-           contains_case_insensitive(msg, "union select") ||
-           contains_case_insensitive(msg, " or 1=1") ||
-           contains_case_insensitive(msg, "' or ") ||
-           contains_case_insensitive(msg, "\" or ") ||
-           contains_case_insensitive(msg, "drop table") ||
-           contains_case_insensitive(msg, "information_schema");
-}
-
-static int is_security_alert(const LogEntry *entry) {
-    return entry->level == LEVEL_ERROR ||
-           entry->level == LEVEL_CRITICAL ||
-           is_sql_injection(entry);
-}
-
-void send_alert(LogEntry *entry) {
-    if (sem_trywait(&alert_vagas) != 0) {
-        if (errno == EAGAIN) {
-            posix_writef(STDERR_FILENO, "[AVISO] Buffer de alertas cheio! Alerta descartado: %s\n",
-                    entry->message);
-            return;
-        }
-
-        perror("sem_trywait");
-        return;
-    }
-
-    pthread_mutex_lock(&alert_trinco);
-    alert_buffer[alert_prodptr] = *entry;
-    alert_prodptr = (alert_prodptr + 1) % ALERT_BUFFER_SIZE;
-    alert_count++;
-    pthread_mutex_unlock(&alert_trinco);
-
-    assinalar(&alert_itens);
-}
-
-void *run_alert_monitor(void *arg) {
-    (void)arg;
-
-    FILE *f_alertas = fopen("alertas_seguranca.txt", "a");
-    if (!f_alertas) {
-        perror("alertas_seguranca.txt");
-        pthread_exit(NULL);
-    }
-
-    while (1) {
-        LogEntry alerta;
-
-        esperar(&alert_itens);
-        pthread_mutex_lock(&alert_trinco);
-
-        if (alert_count == 0 && !consumidores_ativos) {
-            pthread_mutex_unlock(&alert_trinco);
-            break;
-        }
-
-        if (alert_count == 0) {
-            pthread_mutex_unlock(&alert_trinco);
-            continue;
-        }
-
-        alerta = alert_buffer[alert_consptr];
-        alert_consptr = (alert_consptr + 1) % ALERT_BUFFER_SIZE;
-        alert_count--;
-
-        pthread_mutex_unlock(&alert_trinco);
-        assinalar(&alert_vagas);
-
-        time_t agora = time(NULL);
-        struct tm *tm_info = localtime(&agora);
-        char timestamp[26];
-
-        if (tm_info) {
-            strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", tm_info);
-        } else {
-            strncpy(timestamp, "tempo-indisponivel", sizeof(timestamp) - 1);
-            timestamp[sizeof(timestamp) - 1] = '\0';
-        }
-
-        fprintf(f_alertas,
-                "[%s] [%s] IP: %-15s | Evento: %s\n",
-                timestamp,
-                level_to_string(alerta.level),
-                alerta.ip[0] ? alerta.ip : "-",
-                alerta.message);
-        fflush(f_alertas);
-    }
-
-    fclose(f_alertas);
-    pthread_exit(NULL);
-}
-
-static void inserir_no_buffer(LogEntry entry) {
-    esperar(&vagas);
-    pthread_mutex_lock(&trinco);
-
-    buffer[prodptr] = entry;
-    prodptr = (prodptr + 1) % BUFFER_SIZE;
-    buffer_count++;
-
-    pthread_mutex_unlock(&trinco);
-    assinalar(&itens);
-}
-
-static void process_file_prodcons(const char *path, int worker_index) {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) {
-        perror("open");
-        return;
-    }
-
-    if (verbose) posix_writef(STDOUT_FILENO, "[Produtor %d] A abrir: %s\n", worker_index, path);
-
-    char buf[BUF_SIZE];
-    char line[LINE_MAX];
-    int line_len = 0;
-    LogFormat fmt = FORMAT_UNKNOWN;
-    ssize_t bytes_read;
-
-    while ((bytes_read = read(fd, buf, BUF_SIZE)) > 0) {
-        for (ssize_t b = 0; b < bytes_read; b++) {
-            char c = buf[b];
-            if (c == '\n' || c == '\r') {
-                if (line_len == 0) continue;
-                line[line_len] = '\0';
-
-                if (fmt == FORMAT_UNKNOWN) fmt = detect_format(line);
-
-                LogEntry entry;
-                if (parse_line(line, fmt, &entry) == 0) {
-                    inserir_no_buffer(entry);
-                }
-
-                line_len = 0;
-            } else {
-                if (line_len < LINE_MAX - 1) line[line_len++] = c;
+                char tmp_ip[IP_LEN];
+                strncpy(tmp_ip, ips[j], IP_LEN);
+                strncpy(ips[j], ips[j + 1], IP_LEN);
+                strncpy(ips[j + 1], tmp_ip, IP_LEN);
             }
         }
     }
 
-    if (line_len > 0) {
-        line[line_len] = '\0';
-        if (fmt == FORMAT_UNKNOWN) fmt = detect_format(line);
-
-        LogEntry entry;
-        if (parse_line(line, fmt, &entry) == 0) {
-            inserir_no_buffer(entry);
-        }
+    int limite = n < 10 ? n : 10;
+    for (int i = 0; i < limite; i++) {
+        strncpy(r->top_ips[i], ips[i], IP_LEN - 1);
+        r->top_ips[i][IP_LEN - 1] = '\0';
+        r->top_ips_counts[i] = counts[i];
     }
 
-    close(fd);
-    if (verbose) posix_writef(STDOUT_FILENO, "[Produtor %d] Terminou o ficheiro: %s\n", worker_index, path);
+    r->num_alerts = m->num_alerts < MAX_ALERTS ? m->num_alerts : MAX_ALERTS;
+    for (int i = 0; i < r->num_alerts; i++) {
+        strncpy(r->alerts[i], m->alerts[i], ALERT_LEN - 1);
+        r->alerts[i][ALERT_LEN - 1] = '\0';
+    }
 }
 
-void *run_producer(void *arg) {
-    int worker_index = *(int *)arg;
-    int ficheiros_por_produtor = total_ficheiros / num_produtores;
-    int inicio = (worker_index - 1) * ficheiros_por_produtor;
-    int fim = (worker_index == num_produtores)
-        ? total_ficheiros
-        : inicio + ficheiros_por_produtor;
+static void enviar_resultado(int pipe_fd, Metrics *m) {
+    int tipo = MSG_RESULTADO;
+    write(pipe_fd, &tipo, sizeof(tipo));
 
-    if (verbose)
-        posix_writef(STDOUT_FILENO, "[Produtor %d] A comecar a processar ficheiros [%d, %d)\n",
-               worker_index, inicio, fim);
+    WorkerResult r;
+    preparar_resultado(m, &r);
+    write(pipe_fd, &r, sizeof(r));
+}
 
-    for (int i = inicio; i < fim; i++) {
-        process_file_prodcons(ficheiros[i], worker_index);
+void run_worker_pipe(char **ficheiros, int total_ficheiros, int pipe_fd_write, 
+                     int worker_index, long linha_inicio, long linha_fim, int verbose) {
+    
+    Metrics m;
+    init_metrics(&m);
+
+    long minha_quota = linha_fim - linha_inicio;
+    long linha_global = 0;
+    long feitas = 0;
+    
+    if (verbose) {
+        posix_writef(STDOUT_FILENO, "[Filho %d] Intervalo: %ld a %ld (quota: %ld linhas)\n",
+               getpid(), linha_inicio, linha_fim, minha_quota);
     }
 
-    if (verbose)
-        posix_writef(STDOUT_FILENO, "[Produtor %d] Terminou todos os ficheiros!\n", worker_index);
+    for (int i = 0; i < total_ficheiros; i++) {
+        if (linha_global >= linha_fim) break;
+        
+        int fd = open(ficheiros[i], O_RDONLY);
+        if (fd == -1) continue;
+        
+        char buf[BUF_SIZE];
+        char linha[LINE_MAX_LOCAL];
+        int len = 0;
+        LogFormat fmt = FORMAT_UNKNOWN;
+        int bytes;
+        
+        while ((bytes = read(fd, buf, BUF_SIZE)) > 0) {
+            for (int b = 0; b < bytes; b++) {
+                char c = buf[b];
+                
+                if (c == '\n' || c == '\r') {
+                    if (len == 0) continue;
+                    linha[len] = '\0';
+                    
+                    if (linha_global >= linha_inicio && linha_global < linha_fim) {
+                        if (fmt == FORMAT_UNKNOWN) fmt = detect_format(linha);
+                        LogEntry entry;
+                        if (parse_line(linha, fmt, &entry) == 0)
+                            update_metrics(&m, &entry);
+                        
+                        feitas++;
+                        // Envia progresso a cada 100 linhas processadas
+                        if (feitas % 100 == 0) {
+                            enviar_progresso(pipe_fd_write, worker_index, feitas, minha_quota);
+                        }
+                    }
+                    
+                    linha_global++;
+                    len = 0;
+                    
+                    if (linha_global >= linha_fim) break;
+                } else {
+                    if (len < LINE_MAX_LOCAL - 1) linha[len++] = c;
+                }
+            }
+            if (linha_global >= linha_fim) break;
+        }
+        
+        if (len > 0 && linha_global >= linha_inicio && linha_global < linha_fim) {
+            linha[len] = '\0';
+            if (fmt == FORMAT_UNKNOWN) fmt = detect_format(linha);
+            LogEntry entry;
+            if (parse_line(linha, fmt, &entry) == 0) update_metrics(&m, &entry);
+            feitas++;
+            linha_global++;
+        }
+        
+        close(fd);
+    }
 
-    pthread_exit(NULL);
+    // Enviar progresso a 100%
+    enviar_progresso(pipe_fd_write, worker_index, minha_quota, minha_quota);
+    
+    // Enviar resultado final
+    enviar_resultado(pipe_fd_write, &m);
+
+    if (close(pipe_fd_write) == -1) {
+        perror("close");
+        exit(1);
+    }
+
+    exit(0);
+}
+
+// Update LogQueue and LogLine usage
+LogQueue buffer; // Updated to use lowercase 'queue' and 'is_poison' field
+int produtores_ativos = 0;
+pthread_mutex_t metrics_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+void init_bounded_buffer(void) {
+    buffer.in    = 0;
+    buffer.out   = 0;
+    buffer.count = 0;
+    produtores_ativos = 1;
+    pthread_mutex_init(&buffer.mutex, NULL);
+    pthread_mutex_init(&metrics_mutex, NULL);
+    sem_init(&buffer.empty, 0, BUFFER_SIZE);
+    sem_init(&buffer.full,  0, 0);
+}
+
+void destroy_bounded_buffer(void) {
+    pthread_mutex_destroy(&buffer.mutex);
+    sem_destroy(&buffer.empty);
+    sem_destroy(&buffer.full);
+}
+
+static void inserir_no_buffer(LogEntry entry) {
+    esperar(&buffer.empty);
+    pthread_mutex_lock(&buffer.mutex);
+    buffer.queue[buffer.in] = entry;
+    buffer.in = (buffer.in + 1) % BUFFER_SIZE;
+    buffer.count++;
+    pthread_mutex_unlock(&buffer.mutex);
+    assinalar(&buffer.full);
 }
 
 void *run_consumer(void *arg) {
-    int worker_index = *(int *)arg;
-
-    if (verbose)
-        posix_writef(STDOUT_FILENO, "[Consumidor %d] A comecar a processar o buffer...\n", worker_index);
-
+    (void)arg;
     while (1) {
-        LogEntry entry;
+        esperar(&buffer.full);
+        pthread_mutex_lock(&buffer.mutex);
 
-        esperar(&itens);
-        pthread_mutex_lock(&trinco);
-
-        if (buffer_count == 0 && !produtores_ativos) {
-            pthread_mutex_unlock(&trinco);
-            if (verbose)
-                posix_writef(STDOUT_FILENO, "[Consumidor %d] Sem mais dados. A terminar.\n", worker_index);
+        if (buffer.count == 0 && !produtores_ativos) {
+            pthread_mutex_unlock(&buffer.mutex);
             break;
         }
 
-        entry = buffer[consptr];
-        consptr = (consptr + 1) % BUFFER_SIZE;
-        buffer_count--;
+        LogEntry entry = buffer.queue[buffer.out];
+        buffer.out = (buffer.out + 1) % BUFFER_SIZE;
+        buffer.count--;
 
-        pthread_mutex_unlock(&trinco);
-        assinalar(&vagas);
+        pthread_mutex_unlock(&buffer.mutex);
+        assinalar(&buffer.empty);
 
-        pthread_mutex_lock(&metrics_mutex);
-        update_metrics(&global_metrics, &entry);
-        pthread_mutex_unlock(&metrics_mutex);
-
-        if (is_security_alert(&entry)) {
-            send_alert(&entry);
-        }
+        // Process entry here
     }
-
-    if (verbose)
-        posix_writef(STDOUT_FILENO, "[Consumidor %d] Saiu do loop principal.\n", worker_index);
-
-    pthread_exit(NULL);
+    return NULL;
 }
