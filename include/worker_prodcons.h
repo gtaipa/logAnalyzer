@@ -1,36 +1,50 @@
 #ifndef WORKER_PRODCONS_H
 #define WORKER_PRODCONS_H
 
-#include <semaphore.h>
 #include <pthread.h>
+#include <semaphore.h>
+#include "parser.h"
 
-#define BUFFER_SIZE 10
+#define BUFFER_SIZE      10
+#define ALERT_BUFFER_SIZE 64
 
-// 1. A unidade básica de dados 📦
+/* ---- Estrutura do buffer circular ---- */
 typedef struct {
-    int log_type;
-    char text_line[256];
-} LogEntry;
-
-// 2. A estrutura de controlo do Buffer Circular 
-typedef struct {
-    LogEntry queue[BUFFER_SIZE]; 
-    int count;   // Número atual de itens
-    int in;      // Índice para o Produtor (entrada)
-    int out;     // Índice para o Consumidor (saída)
-    pthread_mutex_t mutex; 
-    sem_t empty; // Conta as vagas (espaços livres)
-    sem_t full;  // Conta os itens (mensagens prontas)
+    LogEntry        queue[BUFFER_SIZE];
+    int             count;
+    int             in;
+    int             out;
+    pthread_mutex_t mutex;
+    sem_t           empty;
+    sem_t           full;
 } LogQueue;
 
-// 3. Declaração do buffer como externo 
-// Isto diz ao compilador que a variável 'buffer' existe, 
-// mas será criada num ficheiro .c (normalmente no main.c)
+/* ---- Buffer principal partilhado ---- */
 extern LogQueue buffer;
 
-// 4. Assinaturas das funções (os "contratos") 
+/* ---- Funções de configuração ---- */
+void prodcons_configure(char **ficheiros,
+                        int total_ficheiros,
+                        int num_produtores,
+                        int num_consumidores,
+                        int verbose,
+                        Metrics *global_metrics,
+                        pthread_mutex_t *metrics_mutex);
 
-void* producer_routine(void* arg);
-void* consumer_routine(void* arg);
+/* ---- Funções de inicialização e destruição ---- */
+void init_bounded_buffer(void);
+void destroy_bounded_buffer(void);
+void init_alert_buffer(void);
+void destroy_alert_buffer(void);
+void prodcons_stop_alert_monitor(void);
 
-#endif
+/* ---- Funções das threads ---- */
+void *run_producer(void *arg);
+void *run_consumer(void *arg);
+void *run_alert_monitor(void *arg);
+
+extern int             produtores_ativos;
+extern pthread_mutex_t metrics_mutex;
+
+#endif /* WORKER_PRODCONS_H */
+
