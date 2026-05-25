@@ -121,20 +121,19 @@ LogLevel level_from_string(const char *s) {
 
 LogFormat detect_format(const char *line) {
     if (line == NULL || *line == '\0') return FORMAT_UNKNOWN;
-
     if (line[0] == '{') return FORMAT_JSON;
 
-    if (strlen(line) > 20 &&
+    if (strlen(line) > 20 &&// ver se a mensagem é grande tipico de nginx error log
         isdigit((unsigned char)line[0]) &&
         isdigit((unsigned char)line[1]) &&
         isdigit((unsigned char)line[2]) &&
-        isdigit((unsigned char)line[3]) &&
-        line[4] == '/') {
+        isdigit((unsigned char)line[3]) &&//procura se é uma data(4 numeros seguidos)
+        line[4] == '/') {//ve se tem a barra na data (2024/../..)
         return FORMAT_NGINX_ERROR;
     }
 
     if (looks_like_syslog_timestamp(skip_syslog_priority(line))) {
-        return FORMAT_SYSLOG;
+        return FORMAT_SYSLOG;//chama a funcao de syslogs que ve se tem algo deste genero <32>...
     }
 
     {
@@ -144,10 +143,11 @@ LogFormat detect_format(const char *line) {
             if (*p == '.') dots++;
             p++;
         }
-        if (dots == 3 && *p == ' ') return FORMAT_APACHE;
+        if (dots == 3 && *p == ' ') return FORMAT_APACHE;// analisa para ver se o log começa por um ip como o apache
     }
 
     /* Fallback: tentar os parsers canonicos em ordem. */
+    //para nao crashar caso venham corrompidos, aqui ele tenta ler os logs com o formato de cada um para tentar classificar
     {
         ApacheLogEntry a;
         if (parse_apache_log(line, &a) == 0) return FORMAT_APACHE;
@@ -176,17 +176,17 @@ int parse_line(const char *line, LogFormat format, LogEntry *entry) {
     switch (format) {
         case FORMAT_APACHE: {
             ApacheLogEntry a;
-            if (parse_apache_log(line, &a) != 0) return -1;
-            (void)classify_apache_event(&a, &event);
-            if (!event_matches_mode(&event, g_mode)) return -1;
+            if (parse_apache_log(line, &a) != 0) return -1;//manda para o log_parser para tentar ler o log, se nao conseguir ele descarta a linha
+            (void)classify_apache_event(&a, &event);//manda para o ficheiro do stor de classificacao de logs de cada tipo
+            if (!event_matches_mode(&event, g_mode)) return -1;//manda para o event classifier para ver se o evento corresponde ao modo de analise atual, se nao corresponder ele descarta
 
-            entry->level = level_from_severity(event.severity);
+            entry->level = level_from_severity(event.severity);// volta a empacootar tudo
             entry->http_status = a.status_code;
             strncpy(entry->ip, a.ip, IP_LEN - 1);
             entry->ip[IP_LEN - 1] = '\0';
             copy_description_or_fallback(entry, event.description, a.url);
             return 0;
-        }
+        }//O PROCESSO REPETE-SE PARA OS OUTROS FORMATOS: TENTA PARSEAR, CLASSIFICAR, VER SE CORRESPONDE AO MODO, E EMPACOTAR O RESULTADO PARA O UPDATE DAS METRICAS
         case FORMAT_JSON: {
             JSONLogEntry j;
             if (parse_json_log(line, &j) != 0) return -1;
@@ -226,7 +226,7 @@ int parse_line(const char *line, LogFormat format, LogEntry *entry) {
             return -1;
     }
 }
-
+//NO FIM ATUALIZA AS METRICAS COM O LOG ENTRY PARSEADO, SE O LOG ENTRY FOR VALIDO E CORRESPONDER AO MODO DE ANALISE ATUAL
 void update_metrics(Metrics *m, const LogEntry *e) {
     m->total_lines++;
 
