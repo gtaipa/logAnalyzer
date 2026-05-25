@@ -285,6 +285,7 @@ int main(int argc, char *argv[]) {
     
     long linhas_por_worker = total_linhas / num_procs;
     for (int i = 0; i < num_procs; i++) {
+        configs[i].worker_index = i;
         configs[i].linha_inicio = i * linhas_por_worker;
         configs[i].linha_fim = (i == num_procs - 1) ? total_linhas : configs[i].linha_inicio + linhas_por_worker;
         configs[i].total_linhas_globais = total_linhas;

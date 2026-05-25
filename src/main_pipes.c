@@ -16,6 +16,7 @@
 #define MSG_PROGRESSO 1
 #define MSG_RESULTADO 2
 #define LARGURA_BARRA 20
+#define BUF_SIZE 4096
 
 void run_worker_pipe(char **ficheiros, int total_ficheiros, int pipe_fd_write, 
                      int worker_index, long linha_inicio, long linha_fim, int verbose);
@@ -50,7 +51,6 @@ static void libertar_ficheiros(char **ficheiros, int total_ficheiros) {
 }
 
 static long contar_todas_linhas(char **ficheiros, int total_ficheiros) {
-    #define BUF_SIZE 4096
     long total = 0;
     for (int i = 0; i < total_ficheiros; i++) {
         int fd = open(ficheiros[i], O_RDONLY);
@@ -223,6 +223,7 @@ int main(int argc, char *argv[]) {
     posix_writef(STDOUT_FILENO, "A contar linhas totais...\n");
     long total_linhas = contar_todas_linhas(ficheiros, total_ficheiros);
     posix_writef(STDOUT_FILENO, "Total de linhas encontradas: %ld\n\n", total_linhas);
+
     
     long linhas_por_worker = total_linhas / num_processos;
     
@@ -230,10 +231,6 @@ int main(int argc, char *argv[]) {
     for (int i = 0; i < num_processos; i++) {
         configs[i].linha_inicio = i * linhas_por_worker;
         configs[i].linha_fim = (i == num_processos - 1) ? total_linhas : configs[i].linha_inicio + linhas_por_worker;
-    }
-
-    if (num_processos > total_ficheiros) {
-        num_processos = total_ficheiros;
     }
 
     pid_t *pids = malloc((size_t)num_processos * sizeof(pid_t));

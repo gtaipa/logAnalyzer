@@ -25,6 +25,7 @@ typedef struct {
     long linha_inicio;
     long linha_fim;
     long total_linhas_globais;
+    int worker_index;
 } WorkerConfig;
 
 /* =========================================================

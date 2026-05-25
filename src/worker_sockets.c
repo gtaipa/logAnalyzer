@@ -162,11 +162,10 @@ static void processar_ficheiros(char **ficheiros, int total_ficheiros, Metrics *
 /* ─────────────────────────────────────────────────────────────────────────────
  * 2. Função Principal do Worker
  * ───────────────────────────────────────────────────────────────────────────── */
-void run_worker(char **ficheiros, int total_ficheiros, int num_processos, int worker_index, int verbose) {
+void run_worker(char **ficheiros, int total_ficheiros, int num_processos, int worker_index_original, int verbose) {
     int sock = connect_to_server();
     if (sock < 0) { perror("connect_to_server"); exit(1); }
 
-    /* ✓ NOVA: Receber configuração do PAI (sem contar linhas!) */
     int tipo;
     read(sock, &tipo, sizeof(tipo));
     
@@ -178,6 +177,8 @@ void run_worker(char **ficheiros, int total_ficheiros, int num_processos, int wo
     WorkerConfig cfg;
     read(sock, &cfg, sizeof(cfg));
     
+    /* ✓ NOVA LÓGICA: O worker adota a identidade que o pai lhe deu */
+    int worker_index = cfg.worker_index; 
     long linha_inicio = cfg.linha_inicio;
     long linha_fim = cfg.linha_fim;
     long minha_quota = linha_fim - linha_inicio;
@@ -190,8 +191,6 @@ void run_worker(char **ficheiros, int total_ficheiros, int num_processos, int wo
     init_metrics(&m);
 
     processar_ficheiros(ficheiros, total_ficheiros, &m, sock, worker_index, linha_inicio, linha_fim, verbose);
-
-    /* Enviar progresso 100% e depois resultado */
     enviar_progresso(sock, worker_index, minha_quota, minha_quota);
     enviar_resultado(sock, &m);
     close(sock);
