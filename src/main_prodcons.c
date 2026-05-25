@@ -32,55 +32,147 @@
 #include "posix_io.h"
 #include "worker_prodcons.h"
 
+/* ---- Dashboard ---- */
+#define MAX_WORKERS 64
+static long   g_lines_done[MAX_WORKERS];
+static long   g_lines_total[MAX_WORKERS];
+static int    g_num_workers  = 0;
+static volatile int g_all_done = 0;
+
 /* ALTERAÇÃO: Número de consumidores fixo em 2.
  * O enunciado não especifica — usamos 2 para demonstrar que o padrão
  * funciona com múltiplos consumidores em simultâneo. */
 #define NUM_CONSUMERS 2
 
 /* =========================================================
- * imprimir_relatorio — igual ao de main_threads.c
+ * imprimir_relatorio — atualizado com suporte a modos
  * ========================================================= */
-static void imprimir_relatorio(Metrics *total, char *modo) {
-    posix_writef(STDOUT_FILENO, "\n=== RELATORIO FINAL PRODCONS (%s) ===\n", modo);
-    posix_writef(STDOUT_FILENO, "Total de linhas  : %ld\n", total->total_lines);
-    posix_writef(STDOUT_FILENO, "DEBUG            : %ld\n", total->count_debug);
-    posix_writef(STDOUT_FILENO, "INFO             : %ld\n", total->count_info);
-    posix_writef(STDOUT_FILENO, "WARNINGS         : %ld\n", total->count_warn);
-    posix_writef(STDOUT_FILENO, "ERRORS           : %ld\n", total->count_error);
-    posix_writef(STDOUT_FILENO, "CRITICAL         : %ld\n", total->count_critical);
-    posix_writef(STDOUT_FILENO, "HTTP 4xx         : %ld\n", total->count_4xx);
-    posix_writef(STDOUT_FILENO, "HTTP 5xx         : %ld\n", total->count_5xx);
+static void imprimir_relatorio(Metrics *m, char *modo) {
 
-    /* ALTERAÇÃO: Metrics usa ip_list/ip_count (não top_ips/top_ips_counts,
-     * que são campos de WorkerResult). Ordenamos aqui para mostrar os top 10. */
+    posix_writef(STDOUT_FILENO, "\n=== RELATORIO FINAL PRODCONS (%s) ===\n", modo);
+    posix_writef(STDOUT_FILENO, "Total de linhas  : %ld\n", m->total_lines);
+
+    /* ---- Contadores por nível (Segurança) ---- */
+    if (strcmp(modo, "security") == 0 || strcmp(modo, "full") == 0) {
+        posix_writef(STDOUT_FILENO, "\n--- EVENTOS DE SEGURANCA ---\n");
+        posix_writef(STDOUT_FILENO, "DEBUG            : %ld\n", m->count_debug);
+        posix_writef(STDOUT_FILENO, "INFO             : %ld\n", m->count_info);
+        posix_writef(STDOUT_FILENO, "WARNINGS         : %ld\n", m->count_warn);
+        posix_writef(STDOUT_FILENO, "ERRORS           : %ld\n", m->count_error);
+        posix_writef(STDOUT_FILENO, "CRITICAL         : %ld\n", m->count_critical);
+    }
+
+    /* ---- Performance (HTTP Status Codes) ---- */
+    if (strcmp(modo, "performance") == 0 || strcmp(modo, "full") == 0) {
+        posix_writef(STDOUT_FILENO, "\n--- PERFORMANCE ---\n");
+        posix_writef(STDOUT_FILENO, "HTTP 4xx         : %ld\n", m->count_4xx);
+        posix_writef(STDOUT_FILENO, "HTTP 5xx         : %ld\n", m->count_5xx);
+    }
+
+    /* ---- Tráfego (HTTP Status Codes) ---- */
+    if (strcmp(modo, "traffic") == 0 || strcmp(modo, "full") == 0) {
+        posix_writef(STDOUT_FILENO, "\n--- TRAFEGO ---\n");
+        posix_writef(STDOUT_FILENO, "HTTP 4xx         : %ld\n", m->count_4xx);
+        posix_writef(STDOUT_FILENO, "HTTP 5xx         : %ld\n", m->count_5xx);
+    }
+
+    /* ---- Top 10 IPs (ordenar por contagem) ---- */
     posix_writef(STDOUT_FILENO, "\n--- TOP 10 IPs ---\n");
-    for (int i = 0; i < total->ip_num - 1; i++) {
-        for (int j = 0; j < total->ip_num - i - 1; j++) {
-            if (total->ip_count[j] < total->ip_count[j + 1]) {
-                long tmp_c = total->ip_count[j];
-                total->ip_count[j] = total->ip_count[j + 1];
-                total->ip_count[j + 1] = tmp_c;
+
+    /* Ordenar por bubble sort (igual ao main_sockets.c) */
+    for (int i = 0; i < m->ip_num - 1; i++) {
+        for (int j = 0; j < m->ip_num - i - 1; j++) {
+            if (m->ip_count[j] < m->ip_count[j + 1]) {
+                long tmp_c = m->ip_count[j];
+                m->ip_count[j] = m->ip_count[j + 1];
+                m->ip_count[j + 1] = tmp_c;
+
                 char tmp_ip[IP_LEN];
-                strncpy(tmp_ip, total->ip_list[j], IP_LEN);
-                strncpy(total->ip_list[j], total->ip_list[j + 1], IP_LEN);
-                strncpy(total->ip_list[j + 1], tmp_ip, IP_LEN);
+                strncpy(tmp_ip, m->ip_list[j], IP_LEN);
+                strncpy(m->ip_list[j], m->ip_list[j + 1], IP_LEN);
+                strncpy(m->ip_list[j + 1], tmp_ip, IP_LEN);
             }
         }
     }
-    int limite = total->ip_num < 10 ? total->ip_num : 10;
-    for (int i = 0; i < limite; i++) {
-        posix_writef(STDOUT_FILENO, "%2d. %s (%ld pedidos)\n",
-                     i + 1, total->ip_list[i], total->ip_count[i]);
+
+    int limite = m->ip_num < 10 ? m->ip_num : 10;
+    if (limite == 0) {
+        posix_writef(STDOUT_FILENO, "Nenhum IP encontrado.\n");
+    } else {
+        for (int i = 0; i < limite; i++) {
+            posix_writef(STDOUT_FILENO, "%2d. %-16s (%ld pedidos)\n",
+                         i + 1, m->ip_list[i], m->ip_count[i]);
+        }
     }
 
+    /* ---- Alertas críticos ---- */
     posix_writef(STDOUT_FILENO, "\n--- ALERTAS CRITICOS ---\n");
-    if (total->num_alerts == 0) {
+    if (m->num_alerts == 0) {
         posix_writef(STDOUT_FILENO, "Sem alertas criticos.\n");
     } else {
-        for (int i = 0; i < total->num_alerts; i++)
-            posix_writef(STDOUT_FILENO, "%2d. %s\n", i + 1, total->alerts[i]);
+        for (int i = 0; i < m->num_alerts; i++) {
+            posix_writef(STDOUT_FILENO, "%2d. %s\n", i + 1, m->alerts[i]);
+        }
     }
+
     posix_writef(STDOUT_FILENO, "=================================\n");
+}
+
+/* =========================================================
+ * draw_dashboard / run_monitor_thread
+ * ========================================================= */
+static void draw_dashboard(void) {
+    int linhas = g_num_workers + 7;
+    posix_writef(STDOUT_FILENO, "\033[%dA", linhas);
+    posix_writef(STDOUT_FILENO, "\033[J");
+
+    long total_done  = 0;
+    long total_total = 0;
+    for (int i = 0; i < g_num_workers; i++) {
+        total_done  += g_lines_done[i];
+        total_total += g_lines_total[i];
+    }
+    int total_pct = (total_total > 0) ? (int)(total_done * 100 / total_total) : 0;
+    if (total_pct > 100) total_pct = 100;
+
+    posix_writef(STDOUT_FILENO, "╔══════════════════════════════════════════╗\n");
+    posix_writef(STDOUT_FILENO, "║   LOG ANALYZER - PRODCONS MONITOR        ║\n");
+    posix_writef(STDOUT_FILENO, "╠══════════════════════════════════════════╣\n");
+
+    for (int i = 0; i < g_num_workers; i++) {
+        int pct = (g_lines_total[i] > 0)
+                  ? (int)(g_lines_done[i] * 100 / g_lines_total[i]) : 0;
+        if (pct > 100) pct = 100;
+
+        char bar[21];
+        int filled = pct / 5;
+        for (int b = 0; b < 20; b++) bar[b] = (b < filled) ? '#' : '.';
+        bar[20] = '\0';
+
+        posix_writef(STDOUT_FILENO, "║ Produtor %-2d [%s] %3d%%        ║\n",
+                     i + 1, bar, pct);
+    }
+
+    posix_writef(STDOUT_FILENO, "╠══════════════════════════════════════════╣\n");
+
+    char tot_bar[21];
+    int tot_filled = total_pct / 5;
+    for (int b = 0; b < 20; b++) tot_bar[b] = (b < tot_filled) ? '#' : '.';
+    tot_bar[20] = '\0';
+
+    posix_writef(STDOUT_FILENO, "║ Total     [%s] %3d%%           ║\n",
+                 tot_bar, total_pct);
+    posix_writef(STDOUT_FILENO, "╚══════════════════════════════════════════╝\n");
+}
+
+void *run_monitor_thread(void *arg) {
+    (void)arg;
+    while (!g_all_done) {
+        draw_dashboard();
+        usleep(100000);
+    }
+    draw_dashboard();
+    pthread_exit(NULL);
 }
 
 /* =========================================================
@@ -162,6 +254,18 @@ int main(int argc, char *argv[]) {
     Metrics global_metrics;
     init_metrics(&global_metrics);
 
+    /* ---- Dashboard ---- */
+    g_num_workers = num_prod;
+    g_all_done = 0;
+    memset(g_lines_done, 0, sizeof(g_lines_done));
+    memset(g_lines_total, 0, sizeof(g_lines_total));
+
+    for (int i = 0; i < g_num_workers + 7; i++)
+        posix_writef(STDOUT_FILENO, "\n");
+
+    pthread_t monitor_thread;
+    pthread_create(&monitor_thread, NULL, run_monitor_thread, NULL);
+
     /* ── 3. Preparar argumentos e lançar threads produtoras ── */
 
     pthread_t    *prod_threads = malloc(num_prod * sizeof(pthread_t));
@@ -178,6 +282,8 @@ int main(int argc, char *argv[]) {
                                                         : prod_args[i].inicio + fich_por_prod;
         prod_args[i].worker_index = i;
         prod_args[i].verbose      = verbose;
+        prod_args[i].lines_done   = &g_lines_done[i];
+        prod_args[i].lines_total  = &g_lines_total[i];
 
         if (pthread_create(&prod_threads[i], NULL, run_producer, &prod_args[i]) != 0) {
             perror("pthread_create produtor");
@@ -207,6 +313,9 @@ int main(int argc, char *argv[]) {
      * Ao terminar, cada um decrementa produtores_ativos e acorda os consumidores. */
     for (int i = 0; i < num_prod; i++)
         pthread_join(prod_threads[i], NULL);
+
+    g_all_done = 1;
+    pthread_join(monitor_thread, NULL);
 
     /* ── 6. Esperar que todos os consumidores terminem ──
      * Os consumidores saem quando produtores_ativos == 0 e buffer.count == 0.

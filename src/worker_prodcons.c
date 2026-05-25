@@ -121,6 +121,21 @@ static void inserir_no_buffer(LogEntry entry) {
 void *run_producer(void *arg) {
     ProducerArgs *a = (ProducerArgs *)arg;
 
+    /* Contar total de linhas para o dashboard */
+    long total = 0;
+    for (int i = a->inicio; i < a->fim; i++) {
+        int fd2 = open(a->ficheiros[i], O_RDONLY);
+        if (fd2 < 0) continue;
+        char tmp[4096];
+        ssize_t n;
+        while ((n = read(fd2, tmp, 4096)) > 0)
+            for (ssize_t j = 0; j < n; j++)
+                if (tmp[j] == '\n') total++;
+        close(fd2);
+    }
+    if (a->lines_total) *(a->lines_total) = total;
+    if (a->lines_done)  *(a->lines_done)  = 0;
+
     for (int i = a->inicio; i < a->fim; i++) {
         int fd = open(a->ficheiros[i], O_RDONLY);
         if (fd < 0) {
@@ -157,6 +172,8 @@ void *run_producer(void *arg) {
                     if (parse_line(linha, fmt, &entry) == 0)
                         inserir_no_buffer(entry);
 
+                    if (a->lines_done) (*a->lines_done)++;
+
                     len = 0;
                 } else {
                     if (len < LINE_MAX_LOCAL - 1)
@@ -172,6 +189,7 @@ void *run_producer(void *arg) {
             LogEntry entry;
             if (parse_line(linha, fmt, &entry) == 0)
                 inserir_no_buffer(entry);
+            if (a->lines_done) (*a->lines_done)++;
         }
 
         close(fd);
