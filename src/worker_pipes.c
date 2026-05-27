@@ -5,6 +5,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,21 +15,15 @@
 
 #define BUF_SIZE       4096
 #define LINE_MAX_LOCAL 512
+#define MSG_RESULTADO  2
 
-#define MSG_PROGRESSO 1
-#define MSG_RESULTADO 2
+/*
+ * g_progress — definido em main_pipes.c, apontado para a região mmap MAP_SHARED.
+ * O filho escreve apenas no seu slot [worker_index]; o pai lê todos os slots.
+ */
+extern volatile int *g_progress;
 
-static void enviar_progresso(int pipe_fd, int worker_index, long bytes_done, long bytes_total) {
-    int tipo = MSG_PROGRESSO;
-    write(pipe_fd, &tipo, sizeof(tipo));
-
-    ProgressUpdate pu;
-    pu.pid          = getpid();
-    pu.worker_index = worker_index;
-    pu.bytes_done   = bytes_done;
-    pu.bytes_total  = bytes_total;
-    write(pipe_fd, &pu, sizeof(pu));
-}
+/* ── Resultado final (enviado uma vez, pelo pipe, no fim) ─────────── */
 
 static void preparar_resultado(const Metrics *m, WorkerResult *r) {
     memset(r, 0, sizeof(*r));
@@ -44,22 +39,17 @@ static void preparar_resultado(const Metrics *m, WorkerResult *r) {
 
     char ips[MAX_IPS][IP_LEN];
     long counts[MAX_IPS];
-    int n = m->ip_num;
-    if (n > MAX_IPS) n = MAX_IPS;
+    int n = m->ip_num < MAX_IPS ? m->ip_num : MAX_IPS;
 
     for (int i = 0; i < n; i++) {
         strncpy(ips[i], m->ip_list[i], IP_LEN - 1);
         ips[i][IP_LEN - 1] = '\0';
         counts[i] = m->ip_count[i];
     }
-
     for (int i = 0; i < n - 1; i++) {
         for (int j = 0; j < n - i - 1; j++) {
             if (counts[j] < counts[j + 1]) {
-                long tmp_count = counts[j];
-                counts[j] = counts[j + 1];
-                counts[j + 1] = tmp_count;
-
+                long tmp = counts[j]; counts[j] = counts[j + 1]; counts[j + 1] = tmp;
                 char tmp_ip[IP_LEN];
                 strncpy(tmp_ip, ips[j], IP_LEN);
                 strncpy(ips[j], ips[j + 1], IP_LEN);
@@ -67,14 +57,12 @@ static void preparar_resultado(const Metrics *m, WorkerResult *r) {
             }
         }
     }
-
     int limite = n < 10 ? n : 10;
     for (int i = 0; i < limite; i++) {
         strncpy(r->top_ips[i], ips[i], IP_LEN - 1);
         r->top_ips[i][IP_LEN - 1] = '\0';
         r->top_ips_counts[i] = counts[i];
     }
-
     r->num_alerts = m->num_alerts < MAX_ALERTS ? m->num_alerts : MAX_ALERTS;
     for (int i = 0; i < r->num_alerts; i++) {
         strncpy(r->alerts[i], m->alerts[i], ALERT_LEN - 1);
@@ -85,35 +73,49 @@ static void preparar_resultado(const Metrics *m, WorkerResult *r) {
 static void enviar_resultado(int pipe_fd, Metrics *m) {
     int tipo = MSG_RESULTADO;
     write(pipe_fd, &tipo, sizeof(tipo));
-
     WorkerResult r;
     preparar_resultado(m, &r);
     write(pipe_fd, &r, sizeof(r));
 }
 
-/*
- * run_worker_pipe — Processa a fatia [byte_inicio, byte_fim) do conjunto de ficheiros.
+/* ── Notificação de progresso via SIGUSR1 ─────────────────────────
  *
- * Em vez de contar linhas e re-ler desde o início, usa stat() para obter tamanhos
- * e lseek() para saltar diretamente para o offset certo dentro de cada ficheiro.
- * Ao chegar ao início de uma fatia interior a um ficheiro, avança até ao próximo
- * '\n' para garantir que processamos apenas linhas completas.
- */
+ * Regra: a cada 10% do trabalho concluído, o filho actualiza o seu
+ * slot em g_progress e envia SIGUSR1 ao pai.  O pai redesenha o
+ * dashboard sem custo de I/O no pipe (que fica reservado só para
+ * o resultado final).
+ * ─────────────────────────────────────────────────────────────────── */
+static inline void notificar_progresso(int worker_index, off_t bytes_feitos,
+                                       off_t quota, int *last_milestone) {
+    int pct = (quota > 0) ? (int)(bytes_feitos * 100 / quota) : 100;
+    if (pct > 100) pct = 100;
+
+    int milestone = pct / 10;          /* 0..10 — muda a cada 10% */
+    if (milestone > *last_milestone) {
+        *last_milestone          = milestone;
+        g_progress[worker_index] = pct;
+        kill(getppid(), SIGUSR1);
+    }
+}
+
+/* ── Processamento por fatia de bytes ────────────────────────────── */
+
 void run_worker_pipe(char **ficheiros, int total_ficheiros, int pipe_fd_write,
                      int worker_index, off_t byte_inicio, off_t byte_fim, int verbose) {
     Metrics m;
     init_metrics(&m);
 
-    off_t quota          = byte_fim - byte_inicio;
-    off_t global_offset  = 0; /* byte global acumulado até ao início do ficheiro actual */
-    long  linhas_feitas  = 0; /* contador de linhas para cadência do progresso */
+    off_t quota         = byte_fim - byte_inicio;
+    off_t global_offset = 0;
+    off_t bytes_feitos  = 0;   /* bytes processados dentro da nossa fatia */
+    int   last_milestone = -1; /* última décima de 10% já reportada */
 
     char buf[BUF_SIZE];
     char linha[LINE_MAX_LOCAL];
 
     if (verbose)
         posix_writef(STDOUT_FILENO,
-                     "[Worker %d PID %d] intervalo bytes: [%lld, %lld)\n",
+                     "[Worker %d PID %d] bytes [%lld, %lld)\n",
                      worker_index, (int)getpid(),
                      (long long)byte_inicio, (long long)byte_fim);
 
@@ -122,15 +124,9 @@ void run_worker_pipe(char **ficheiros, int total_ficheiros, int pipe_fd_write,
         if (stat(ficheiros[i], &st) != 0) continue;
         off_t fsize = st.st_size;
 
-        /* Ficheiro completamente antes da nossa fatia → ignorar */
-        if (global_offset + fsize <= byte_inicio) {
-            global_offset += fsize;
-            continue;
-        }
-        /* Ficheiro completamente depois da nossa fatia → parar */
+        if (global_offset + fsize <= byte_inicio) { global_offset += fsize; continue; }
         if (global_offset >= byte_fim) break;
 
-        /* Offset local (dentro deste ficheiro) onde a nossa fatia começa e acaba */
         off_t local_start = (byte_inicio > global_offset) ? byte_inicio - global_offset : 0;
         off_t local_end   = (byte_fim < global_offset + fsize) ? byte_fim - global_offset : fsize;
 
@@ -138,38 +134,24 @@ void run_worker_pipe(char **ficheiros, int total_ficheiros, int pipe_fd_write,
         if (fd < 0) { global_offset += fsize; continue; }
 
         if (verbose)
-            posix_writef(STDOUT_FILENO,
-                         "[Worker %d] %s local [%lld-%lld]\n",
+            posix_writef(STDOUT_FILENO, "[Worker %d] %s [%lld-%lld]\n",
                          worker_index, ficheiros[i],
                          (long long)local_start, (long long)local_end);
 
-        /* Saltar directamente para o offset de início */
         if (lseek(fd, local_start, SEEK_SET) < 0) {
-            perror("lseek");
-            close(fd);
-            global_offset += fsize;
-            continue;
+            perror("lseek"); close(fd); global_offset += fsize; continue;
         }
 
         off_t file_pos = local_start;
 
-        /*
-         * Se não estamos no início do ficheiro, estamos potencialmente a meio de
-         * uma linha que pertence ao worker anterior.  Avançamos até ao próximo '\n'.
-         */
+        /* Se não estamos no início do ficheiro, avançar até ao próximo '\n' */
         if (local_start > 0) {
-            char c;
-            ssize_t r;
+            char c; ssize_t r;
             while ((r = read(fd, &c, 1)) == 1) {
                 file_pos++;
                 if (c == '\n') break;
             }
-            if (r <= 0) {
-                /* EOF ou erro — não há linhas neste ficheiro para nós */
-                close(fd);
-                global_offset += fsize;
-                continue;
-            }
+            if (r <= 0) { close(fd); global_offset += fsize; continue; }
         }
 
         int len  = 0;
@@ -194,51 +176,38 @@ void run_worker_pipe(char **ficheiros, int total_ficheiros, int pipe_fd_write,
                         len = 0;
                     }
 
-                    linhas_feitas++;
-                    if (linhas_feitas % 100 == 0) {
-                        /* Progresso em bytes dentro da nossa quota */
-                        off_t bytes_done = global_offset + file_pos - byte_inicio;
-                        if (bytes_done > quota) bytes_done = quota;
-                        enviar_progresso(pipe_fd_write, worker_index,
-                                         (long)bytes_done, (long)quota);
-                    }
+                    /* Actualizar contagem de bytes e verificar milestone */
+                    bytes_feitos = global_offset + file_pos - byte_inicio;
+                    if (bytes_feitos > quota) bytes_feitos = quota;
+                    notificar_progresso(worker_index, bytes_feitos,
+                                        quota, &last_milestone);
 
-                    /* Completámos a última linha da nossa fatia → podemos parar */
                     if (file_pos >= local_end) done = 1;
 
                 } else if (c != '\r') {
                     if (len < LINE_MAX_LOCAL - 1) linha[len++] = c;
-                    /*
-                     * Se já passámos local_end mas ainda não vimos '\n', continuamos
-                     * a acumular para terminar a linha actual (sem entrar no done).
-                     */
                 }
             }
         }
 
-        /* Última linha sem '\n' (fim de ficheiro sem terminador) */
+        /* Última linha sem '\n' */
         if (len > 0) {
             linha[len] = '\0';
             if (fmt == FORMAT_UNKNOWN) fmt = detect_format(linha);
             LogEntry entry;
-            if (parse_line(linha, fmt, &entry) == 0)
-                update_metrics(&m, &entry);
+            if (parse_line(linha, fmt, &entry) == 0) update_metrics(&m, &entry);
         }
 
         close(fd);
         global_offset += fsize;
     }
 
-    /* Progresso final a 100% */
-    enviar_progresso(pipe_fd_write, worker_index, (long)quota, (long)quota);
+    /* Garantir 100% no dashboard antes de enviar o resultado */
+    g_progress[worker_index] = 100;
+    kill(getppid(), SIGUSR1);
 
-    /* Resultado final */
     enviar_resultado(pipe_fd_write, &m);
 
-    if (close(pipe_fd_write) == -1) {
-        perror("close");
-        exit(1);
-    }
-
+    if (close(pipe_fd_write) == -1) { perror("close"); exit(1); }
     exit(0);
 }
