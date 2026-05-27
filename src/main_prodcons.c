@@ -39,11 +39,6 @@ static long   g_lines_total[MAX_WORKERS];
 static int    g_num_workers  = 0;
 static volatile int g_all_done = 0;
 
-/* ALTERAÇÃO: Número de consumidores fixo em 2.
- * O enunciado não especifica — usamos 2 para demonstrar que o padrão
- * funciona com múltiplos consumidores em simultâneo. */
-#define NUM_CONSUMERS 2
-
 /* =========================================================
  * imprimir_relatorio — atualizado com suporte a modos
  * ========================================================= */
@@ -239,9 +234,12 @@ int main(int argc, char *argv[]) {
     /* Não faz sentido ter mais produtores do que ficheiros */
     if (num_prod > total_ficheiros) num_prod = total_ficheiros;
 
+    /* Consumidores adaptam-se aos produtores (simetria) */
+    int num_cons = num_prod;
+
     posix_writef(STDOUT_FILENO,
                  "Ficheiros: %d | Produtores: %d | Consumidores: %d | Modo: %s\n\n",
-                 total_ficheiros, num_prod, NUM_CONSUMERS, modo);
+                 total_ficheiros, num_prod, num_cons, modo);
 
     /* ── 2. Inicializar o buffer circular e as métricas globais ── */
 
@@ -293,11 +291,11 @@ int main(int argc, char *argv[]) {
 
     /* ── 4. Preparar argumentos e lançar threads consumidoras ── */
 
-    pthread_t    *cons_threads = malloc(NUM_CONSUMERS * sizeof(pthread_t));
-    ConsumerArgs *cons_args    = malloc(NUM_CONSUMERS * sizeof(ConsumerArgs));
+    pthread_t    *cons_threads = malloc(num_cons * sizeof(pthread_t));
+    ConsumerArgs *cons_args    = malloc(num_cons * sizeof(ConsumerArgs));
     if (!cons_threads || !cons_args) { perror("malloc"); exit(1); }
 
-    for (int i = 0; i < NUM_CONSUMERS; i++) {
+    for (int i = 0; i < num_cons; i++) {
         cons_args[i].global_metrics = &global_metrics;
         cons_args[i].metrics_mutex  = &metrics_mutex;
         cons_args[i].worker_index   = i;
@@ -320,7 +318,7 @@ int main(int argc, char *argv[]) {
     /* ── 6. Esperar que todos os consumidores terminem ──
      * Os consumidores saem quando produtores_ativos == 0 e buffer.count == 0.
      * O último produtor acorda-os (ver run_producer em worker_prodcons.c). */
-    for (int i = 0; i < NUM_CONSUMERS; i++)
+    for (int i = 0; i < num_cons; i++)
         pthread_join(cons_threads[i], NULL);
 
     /* ── 7. Destruir buffer e imprimir relatório ── */
