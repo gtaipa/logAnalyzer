@@ -3,6 +3,7 @@
 
 #include <unistd.h>
 #include <stdint.h>
+#include <sys/types.h>
 
 #include "parser.h"  /* IP_LEN */
 
@@ -22,9 +23,9 @@
  * Estrutura enviada do pai para o filho — configuração
  * ========================================================= */
 typedef struct {
-    long linha_inicio;
-    long linha_fim;
-    long total_linhas_globais;
+    off_t byte_inicio;
+    off_t byte_fim;
+    off_t total_bytes_globais;
     int worker_index;
 } WorkerConfig;
 
@@ -53,8 +54,8 @@ typedef struct {
 typedef struct {
     pid_t pid;
     int   worker_index;
-    long  lines_done;
-    long  lines_total;
+    long  bytes_done;
+    long  bytes_total;
 } ProgressUpdate;
 
 /* =========================================================
@@ -78,7 +79,7 @@ int connect_to_server(void);
  * ========================================================= */
 ssize_t readn(int fd, void *ptr, size_t nbytes);
 ssize_t writen(int fd, void *ptr, size_t nbytes);
-void run_worker_pipe(char **ficheiros, int total_ficheiros, int pipe_fd_write, 
-                     int worker_index, long linha_inicio, long linha_fim, int verbose);
+void run_worker_pipe(char **ficheiros, int total_ficheiros, int pipe_fd_write,
+                     int worker_index, off_t byte_inicio, off_t byte_fim, int verbose);
 
 #endif /* IPC_H */
