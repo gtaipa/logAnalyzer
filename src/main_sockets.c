@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/select.h>
 #include <sys/socket.h>
@@ -54,8 +55,8 @@ static void desenhar_dashboard(ProgressUpdate *progressos, int num_workers) {
     printf("\033[J");
 
     for (int i = 0; i < num_workers; i++) {
-        long feitas = progressos[i].lines_done;
-        long total  = progressos[i].lines_total;
+        long feitas = progressos[i].bytes_done;
+        long total  = progressos[i].bytes_total;
 
         int pct = (total > 0) ? (int)(feitas * 100 / total) : 0;
         if (pct > 100) pct = 100;
@@ -67,7 +68,7 @@ static void desenhar_dashboard(ProgressUpdate *progressos, int num_workers) {
             barra[b] = (b < cheio) ? '#' : '.';
         barra[LARGURA_BARRA] = '\0';
 
-        printf("Worker %2d [%s] %3d%% (%ld/%ld linhas)\n",
+        printf("Worker %2d [%s] %3d%% (%ld/%ld bytes)\n",
                i, barra, pct, feitas, total);
     }
 
@@ -84,22 +85,13 @@ static void libertar_ficheiros(char **ficheiros, int total) {
     free(ficheiros);
 }
 
-/* Contar o número total de linhas em TODOS os ficheiros (uma só vez) */
-static long contar_todas_linhas(char **ficheiros, int total_ficheiros) {
-    #define BUF_SIZE 4096
-    long total = 0;
-    
+/* Obter o total de bytes de todos os ficheiros via stat() — sem ler o conteúdo */
+static off_t obter_bytes_totais(char **ficheiros, int total_ficheiros) {
+    off_t total = 0;
+    struct stat st;
     for (int i = 0; i < total_ficheiros; i++) {
-        int fd = open(ficheiros[i], O_RDONLY);
-        if (fd < 0) continue;
-        
-        char buf[BUF_SIZE];
-        int bytes;
-        while ((bytes = read(fd, buf, BUF_SIZE)) > 0) {
-            for (int j = 0; j < bytes; j++)
-                if (buf[j] == '\n') total++;
-        }
-        close(fd);
+        if (stat(ficheiros[i], &st) == 0)
+            total += st.st_size;
     }
     return total;
 }
@@ -274,21 +266,22 @@ int main(int argc, char *argv[]) {
     printf("Ficheiros encontrados: %d | Workers: %d | Modo: %s\n\n",
            total_ficheiros, num_procs, modo);
 
-    /* ── 1.5 Contar TODAS as linhas UMA SÓ VEZ (antes do fork) ── */
-    printf("A contar linhas totais...\n");
-    long total_linhas = contar_todas_linhas(ficheiros, total_ficheiros);
-    printf("Total de linhas encontradas: %ld\n\n", total_linhas);
-    
+    /* ── 1.5 Obter dimensão total via stat() — sem ler os ficheiros ── */
+    printf("A calcular dimensao total...\n");
+    off_t total_bytes = obter_bytes_totais(ficheiros, total_ficheiros);
+    printf("Total de bytes encontrados: %lld\n\n", (long long)total_bytes);
+
     /* Calcular configuração de cada worker antes do fork */
     WorkerConfig *configs = malloc(num_procs * sizeof(WorkerConfig));
     if (!configs) { perror("malloc"); exit(1); }
-    
-    long linhas_por_worker = total_linhas / num_procs;
+
+    off_t bytes_por_worker = total_bytes / num_procs;
     for (int i = 0; i < num_procs; i++) {
-        configs[i].worker_index = i;
-        configs[i].linha_inicio = i * linhas_por_worker;
-        configs[i].linha_fim = (i == num_procs - 1) ? total_linhas : configs[i].linha_inicio + linhas_por_worker;
-        configs[i].total_linhas_globais = total_linhas;
+        configs[i].worker_index        = i;
+        configs[i].byte_inicio         = (off_t)i * bytes_por_worker;
+        configs[i].byte_fim            = (i == num_procs - 1) ? total_bytes
+                                         : configs[i].byte_inicio + bytes_por_worker;
+        configs[i].total_bytes_globais = total_bytes;
     }
 
     /* ── 2. Criar o socket servidor (antes do fork, para os filhos herdarem o path) ── */
@@ -465,7 +458,7 @@ int main(int argc, char *argv[]) {
                 acumular(&total, &r, (char (*)[IP_LEN])ip_list_global, ip_count_global, &ip_num_global);
 
                 /* Marcar este worker como 100% terminado */
-                progressos[i].lines_done = progressos[i].lines_total;
+                progressos[i].bytes_done = progressos[i].bytes_total;
                 desenhar_dashboard(progressos, num_procs);
 
                 close(client_fds[i]);
