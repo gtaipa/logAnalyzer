@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/select.h>
 #include <unistd.h>
@@ -18,16 +19,16 @@
 #define LARGURA_BARRA 20
 #define BUF_SIZE 4096
 
-void run_worker_pipe(char **ficheiros, int total_ficheiros, int pipe_fd_write, 
-                     int worker_index, long linha_inicio, long linha_fim, int verbose);
+void run_worker_pipe(char **ficheiros, int total_ficheiros, int pipe_fd_write,
+                     int worker_index, off_t byte_inicio, off_t byte_fim, int verbose);
 
 static void desenhar_dashboard(ProgressUpdate *progressos, int num_workers) {
     printf("\033[%dA", num_workers);
     printf("\033[J");
 
     for (int i = 0; i < num_workers; i++) {
-        long feitas = progressos[i].lines_done;
-        long total  = progressos[i].lines_total;
+        long feitas = progressos[i].bytes_done;
+        long total  = progressos[i].bytes_total;
 
         int pct = (total > 0) ? (int)(feitas * 100 / total) : 0;
         if (pct > 100) pct = 100;
@@ -38,7 +39,7 @@ static void desenhar_dashboard(ProgressUpdate *progressos, int num_workers) {
             barra[b] = (b < cheio) ? '#' : '.';
         barra[LARGURA_BARRA] = '\0';
 
-        printf("Worker %2d [%s] %3d%% (%ld/%ld linhas)\n",
+        printf("Worker %2d [%s] %3d%% (%ld/%ld bytes)\n",
                i, barra, pct, feitas, total);
     }
     fflush(stdout);
@@ -50,18 +51,12 @@ static void libertar_ficheiros(char **ficheiros, int total_ficheiros) {
     free(ficheiros);
 }
 
-static long contar_todas_linhas(char **ficheiros, int total_ficheiros) {
-    long total = 0;
+static off_t obter_bytes_totais(char **ficheiros, int total_ficheiros) {
+    off_t total = 0;
+    struct stat st;
     for (int i = 0; i < total_ficheiros; i++) {
-        int fd = open(ficheiros[i], O_RDONLY);
-        if (fd < 0) continue;
-        char buf[BUF_SIZE];
-        int bytes;
-        while ((bytes = read(fd, buf, BUF_SIZE)) > 0) {
-            for (int j = 0; j < bytes; j++)
-                if (buf[j] == '\n') total++;
-        }
-        close(fd);
+        if (stat(ficheiros[i], &st) == 0)
+            total += st.st_size;
     }
     return total;
 }
@@ -220,17 +215,19 @@ int main(int argc, char *argv[]) {
         exit(0);
     }
 
-    posix_writef(STDOUT_FILENO, "A contar linhas totais...\n");
-    long total_linhas = contar_todas_linhas(ficheiros, total_ficheiros);
-    posix_writef(STDOUT_FILENO, "Total de linhas encontradas: %ld\n\n", total_linhas);
+    posix_writef(STDOUT_FILENO, "A calcular dimensao total...\n");
+    off_t total_bytes = obter_bytes_totais(ficheiros, total_ficheiros);
+    posix_writef(STDOUT_FILENO, "Total de bytes encontrados: %lld\n\n", (long long)total_bytes);
 
-    
-    long linhas_por_worker = total_linhas / num_processos;
-    
+    off_t bytes_por_worker = total_bytes / num_processos;
+
     WorkerConfig *configs = malloc((size_t)num_processos * sizeof(WorkerConfig));
     for (int i = 0; i < num_processos; i++) {
-        configs[i].linha_inicio = i * linhas_por_worker;
-        configs[i].linha_fim = (i == num_processos - 1) ? total_linhas : configs[i].linha_inicio + linhas_por_worker;
+        configs[i].worker_index         = i;
+        configs[i].byte_inicio          = (off_t)i * bytes_por_worker;
+        configs[i].byte_fim             = (i == num_processos - 1) ? total_bytes
+                                          : configs[i].byte_inicio + bytes_por_worker;
+        configs[i].total_bytes_globais  = total_bytes;
     }
 
     pid_t *pids = malloc((size_t)num_processos * sizeof(pid_t));
@@ -251,9 +248,8 @@ int main(int argc, char *argv[]) {
             for (int j = 0; j < i; j++) {
                 if (pipes_leitura[j] != -1) close(pipes_leitura[j]);
             }
-            // Chama a rotina com o worker_index (i) inserido!
-            run_worker_pipe(ficheiros, total_ficheiros, fd[1], i, 
-                           configs[i].linha_inicio, configs[i].linha_fim, verbose);
+            run_worker_pipe(ficheiros, total_ficheiros, fd[1], i,
+                           configs[i].byte_inicio, configs[i].byte_fim, verbose);
             exit(0);
         }
 
@@ -321,7 +317,7 @@ int main(int argc, char *argv[]) {
                     read(pipes_leitura[i], &r, sizeof(r));
                     acumular_resultado(&total, &r, (char (*)[IP_LEN])ip_list_global, ip_count_global, &ip_num_global);
 
-                    progressos[i].lines_done = progressos[i].lines_total;
+                    progressos[i].bytes_done = progressos[i].bytes_total;
                     desenhar_dashboard(progressos, num_processos);
 
                     close(pipes_leitura[i]);
