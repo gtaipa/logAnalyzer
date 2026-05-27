@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/select.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "ipc.h"
@@ -236,6 +237,8 @@ int main(int argc, char *argv[]) {
 
     fflush(NULL);
 
+    time_t t_inicio = time(NULL);
+
     for (int i = 0; i < num_processos; i++) {
         int fd[2];
         if (pipe(fd) == -1) { perror("pipe"); exit(1); }
@@ -333,7 +336,10 @@ int main(int argc, char *argv[]) {
         waitpid(pids[i], &status, 0);
     }
 
+    long elapsed = (long)(time(NULL) - t_inicio);
+
     imprimir_relatorio(&total, modo);
+    printf("Tempo de processamento: %ldmin %02lds\n", elapsed / 60, elapsed % 60);
 
     free(progressos);
     free(pipes_leitura);
