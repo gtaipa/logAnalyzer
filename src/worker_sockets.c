@@ -5,29 +5,24 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 
-#define BUF_SIZE  4096
-#define LINHA_MAX  512
+#define BUF_SIZE   4096
+#define LINHA_MAX   512
+#define MSG_RESULTADO 2
 
-/* ─────────────────────────────────────────────────────────────────────────────
- * Funções para enviar mensagens ao pai
- * ───────────────────────────────────────────────────────────────────────────── */
-static void enviar_progresso(int sock, int worker_index, long bytes_done, long bytes_total) {
-    int tipo = MSG_PROGRESSO;
-    write(sock, &tipo, sizeof(tipo));
+/*
+ * g_progress — definido em main_sockets.c, aponta para região mmap MAP_SHARED.
+ * O filho escreve apenas no seu slot [worker_index].
+ */
+extern volatile int *g_progress;
 
-    ProgressUpdate pu;
-    pu.pid          = getpid();
-    pu.worker_index = worker_index;
-    pu.bytes_done   = bytes_done;
-    pu.bytes_total  = bytes_total;
-    write(sock, &pu, sizeof(pu));
-}
+/* ── Resultado final ──────────────────────────────────────────────── */
 
 static void preparar_resultado(const Metrics *m, WorkerResult *r) {
     memset(r, 0, sizeof(*r));
@@ -43,22 +38,17 @@ static void preparar_resultado(const Metrics *m, WorkerResult *r) {
 
     char ips[MAX_IPS][IP_LEN];
     long counts[MAX_IPS];
-    int n = m->ip_num;
-    if (n > MAX_IPS) n = MAX_IPS;
+    int n = m->ip_num < MAX_IPS ? m->ip_num : MAX_IPS;
 
     for (int i = 0; i < n; i++) {
         strncpy(ips[i], m->ip_list[i], IP_LEN - 1);
         ips[i][IP_LEN - 1] = '\0';
         counts[i] = m->ip_count[i];
     }
-
     for (int i = 0; i < n - 1; i++) {
         for (int j = 0; j < n - i - 1; j++) {
             if (counts[j] < counts[j + 1]) {
-                long tmp_count = counts[j];
-                counts[j] = counts[j + 1];
-                counts[j + 1] = tmp_count;
-
+                long tmp = counts[j]; counts[j] = counts[j + 1]; counts[j + 1] = tmp;
                 char tmp_ip[IP_LEN];
                 strncpy(tmp_ip, ips[j], IP_LEN);
                 strncpy(ips[j], ips[j + 1], IP_LEN);
@@ -66,14 +56,12 @@ static void preparar_resultado(const Metrics *m, WorkerResult *r) {
             }
         }
     }
-
     int limite = n < 10 ? n : 10;
     for (int i = 0; i < limite; i++) {
         strncpy(r->top_ips[i], ips[i], IP_LEN - 1);
         r->top_ips[i][IP_LEN - 1] = '\0';
         r->top_ips_counts[i] = counts[i];
     }
-
     r->num_alerts = m->num_alerts < MAX_ALERTS ? m->num_alerts : MAX_ALERTS;
     for (int i = 0; i < r->num_alerts; i++) {
         strncpy(r->alerts[i], m->alerts[i], ALERT_LEN - 1);
@@ -84,31 +72,39 @@ static void preparar_resultado(const Metrics *m, WorkerResult *r) {
 static void enviar_resultado(int sock, Metrics *m) {
     int tipo = MSG_RESULTADO;
     write(sock, &tipo, sizeof(tipo));
-
     WorkerResult r;
     preparar_resultado(m, &r);
     write(sock, &r, sizeof(r));
 }
 
-/* ─────────────────────────────────────────────────────────────────────────────
- * Processamento por fatia de bytes
+/* ── Notificação de progresso via SIGUSR1 ─────────────────────────
  *
- * Recebe o intervalo global [byte_inicio, byte_fim).  Para cada ficheiro cujo
- * intervalo de bytes se sobreponha ao nosso, usa lseek() para saltar directamente
- * para o offset correcto e lê apenas os bytes que nos pertencem.
- *
- * Tratamento de fronteiras:
- *   • Início no meio de um ficheiro → avança até ao próximo '\n' (evita linha
- *     parcial que pertence ao worker anterior).
- *   • Fim no meio de uma linha → continua a ler até ao '\n' (para não partir
- *     uma linha entre dois workers).
- * ───────────────────────────────────────────────────────────────────────────── */
+ * A cada 10% concluídos, o filho actualiza o seu slot em g_progress
+ * e envia SIGUSR1 ao pai.  O socket fica reservado apenas para o
+ * resultado final.
+ * ─────────────────────────────────────────────────────────────────── */
+static inline void notificar_progresso(int worker_index, off_t bytes_feitos,
+                                       off_t quota, int *last_milestone) {
+    int pct = (quota > 0) ? (int)(bytes_feitos * 100 / quota) : 100;
+    if (pct > 100) pct = 100;
+
+    int milestone = pct / 10;
+    if (milestone > *last_milestone) {
+        *last_milestone          = milestone;
+        g_progress[worker_index] = pct;
+        kill(getppid(), SIGUSR1);
+    }
+}
+
+/* ── Processamento por fatia de bytes ────────────────────────────── */
+
 static void processar_por_bytes(char **ficheiros, int total_ficheiros, Metrics *m,
-                                int sock, int worker_index,
-                                off_t byte_inicio, off_t byte_fim, int verbose) {
+                                int worker_index, off_t byte_inicio, off_t byte_fim,
+                                int verbose) {
     off_t quota         = byte_fim - byte_inicio;
     off_t global_offset = 0;
-    long  linhas_feitas = 0;
+    off_t bytes_feitos  = 0;
+    int   last_milestone = -1;
 
     char buf[BUF_SIZE];
     char linha[LINHA_MAX];
@@ -118,12 +114,7 @@ static void processar_por_bytes(char **ficheiros, int total_ficheiros, Metrics *
         if (stat(ficheiros[i], &st) != 0) continue;
         off_t fsize = st.st_size;
 
-        /* Ficheiro completamente antes da nossa fatia */
-        if (global_offset + fsize <= byte_inicio) {
-            global_offset += fsize;
-            continue;
-        }
-        /* Ficheiro completamente depois da nossa fatia */
+        if (global_offset + fsize <= byte_inicio) { global_offset += fsize; continue; }
         if (global_offset >= byte_fim) break;
 
         off_t local_start = (byte_inicio > global_offset) ? byte_inicio - global_offset : 0;
@@ -133,32 +124,23 @@ static void processar_por_bytes(char **ficheiros, int total_ficheiros, Metrics *
         if (fd < 0) { global_offset += fsize; continue; }
 
         if (verbose)
-            printf("[Worker %d] %s local [%lld-%lld]\n",
+            printf("[Worker %d] %s [%lld-%lld]\n",
                    worker_index, ficheiros[i],
                    (long long)local_start, (long long)local_end);
 
         if (lseek(fd, local_start, SEEK_SET) < 0) {
-            perror("lseek");
-            close(fd);
-            global_offset += fsize;
-            continue;
+            perror("lseek"); close(fd); global_offset += fsize; continue;
         }
 
         off_t file_pos = local_start;
 
-        /* Se não estamos no início do ficheiro, avançar até ao próximo '\n' */
         if (local_start > 0) {
-            char c;
-            ssize_t r;
+            char c; ssize_t r;
             while ((r = read(fd, &c, 1)) == 1) {
                 file_pos++;
                 if (c == '\n') break;
             }
-            if (r <= 0) {
-                close(fd);
-                global_offset += fsize;
-                continue;
-            }
+            if (r <= 0) { close(fd); global_offset += fsize; continue; }
         }
 
         int len  = 0;
@@ -183,25 +165,19 @@ static void processar_por_bytes(char **ficheiros, int total_ficheiros, Metrics *
                         len = 0;
                     }
 
-                    linhas_feitas++;
-                    if (linhas_feitas % 100 == 0) {
-                        off_t bytes_done = global_offset + file_pos - byte_inicio;
-                        if (bytes_done > quota) bytes_done = quota;
-                        enviar_progresso(sock, worker_index,
-                                         (long)bytes_done, (long)quota);
-                    }
+                    bytes_feitos = global_offset + file_pos - byte_inicio;
+                    if (bytes_feitos > quota) bytes_feitos = quota;
+                    notificar_progresso(worker_index, bytes_feitos,
+                                        quota, &last_milestone);
 
-                    /* Linha completa e já passámos o fim da nossa fatia → parar */
                     if (file_pos >= local_end) done = 1;
 
                 } else if (c != '\r') {
                     if (len < LINHA_MAX - 1) linha[len++] = c;
-                    /* Se passámos local_end a meio de uma linha, continuamos a acumular */
                 }
             }
         }
 
-        /* Última linha sem '\n' (EOF sem terminador) */
         if (len > 0) {
             linha[len] = '\0';
             if (fmt == FORMAT_UNKNOWN) fmt = detect_format(linha);
@@ -215,10 +191,10 @@ static void processar_por_bytes(char **ficheiros, int total_ficheiros, Metrics *
     }
 }
 
-/* ─────────────────────────────────────────────────────────────────────────────
- * Função Principal do Worker (sockets)
- * ───────────────────────────────────────────────────────────────────────────── */
-void run_worker(char **ficheiros, int total_ficheiros, int num_processos, int worker_index_original, int verbose) {
+/* ── Função principal do worker (sockets) ────────────────────────── */
+
+void run_worker(char **ficheiros, int total_ficheiros, int num_processos,
+                int worker_index_original, int verbose) {
     (void)num_processos;
     (void)worker_index_original;
 
@@ -227,9 +203,8 @@ void run_worker(char **ficheiros, int total_ficheiros, int num_processos, int wo
 
     int tipo;
     read(sock, &tipo, sizeof(tipo));
-
     if (tipo != MSG_CONFIG) {
-        fprintf(stderr, "Worker esperava MSG_CONFIG, recebeu tipo %d\n", tipo);
+        fprintf(stderr, "Worker esperava MSG_CONFIG, recebeu %d\n", tipo);
         exit(1);
     }
 
@@ -239,20 +214,22 @@ void run_worker(char **ficheiros, int total_ficheiros, int num_processos, int wo
     int   worker_index = cfg.worker_index;
     off_t byte_inicio  = cfg.byte_inicio;
     off_t byte_fim     = cfg.byte_fim;
-    off_t quota        = byte_fim - byte_inicio;
 
     if (verbose)
-        printf("[Worker %d (PID %d)] intervalo bytes: [%lld, %lld) quota=%lld\n",
+        printf("[Worker %d PID %d] bytes [%lld, %lld)\n",
                worker_index, (int)getpid(),
-               (long long)byte_inicio, (long long)byte_fim, (long long)quota);
+               (long long)byte_inicio, (long long)byte_fim);
 
     Metrics m;
     init_metrics(&m);
 
     processar_por_bytes(ficheiros, total_ficheiros, &m,
-                        sock, worker_index, byte_inicio, byte_fim, verbose);
+                        worker_index, byte_inicio, byte_fim, verbose);
 
-    enviar_progresso(sock, worker_index, (long)quota, (long)quota);
+    /* Garantir 100% antes de enviar resultado */
+    g_progress[worker_index] = 100;
+    kill(getppid(), SIGUSR1);
+
     enviar_resultado(sock, &m);
     close(sock);
 }
