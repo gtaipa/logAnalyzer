@@ -25,6 +25,7 @@
 #include <string.h>
 #include <dirent.h>
 #include <pthread.h>
+#include <time.h>
 #include <unistd.h>
 #include <fcntl.h>
 
@@ -37,6 +38,7 @@
 static long   g_lines_done[MAX_WORKERS];
 static long   g_lines_total[MAX_WORKERS];
 static int    g_num_workers  = 0;
+static time_t g_start_time   = 0;
 static volatile int g_all_done = 0;
 
 /* ALTERAÇÃO: Número de consumidores fixo em 2.
@@ -122,7 +124,7 @@ static void imprimir_relatorio(Metrics *m, char *modo) {
  * draw_dashboard / run_monitor_thread
  * ========================================================= */
 static void draw_dashboard(void) {
-    int linhas = g_num_workers + 7;
+    int linhas = g_num_workers + 8;  /* +1 por causa da linha Elapsed */
     posix_writef(STDOUT_FILENO, "\033[%dA", linhas);
     posix_writef(STDOUT_FILENO, "\033[J");
 
@@ -160,8 +162,15 @@ static void draw_dashboard(void) {
     for (int b = 0; b < 20; b++) tot_bar[b] = (b < tot_filled) ? '#' : '.';
     tot_bar[20] = '\0';
 
+    time_t elapsed = time(NULL) - g_start_time;
+    int hh = (int)(elapsed / 3600);
+    int mm = (int)((elapsed % 3600) / 60);
+    int ss = (int)(elapsed % 60);
+
     posix_writef(STDOUT_FILENO, "║ Total     [%s] %3d%%           ║\n",
                  tot_bar, total_pct);
+    posix_writef(STDOUT_FILENO, "║ Elapsed: %02d:%02d:%02d                      ║\n",
+                 hh, mm, ss);
     posix_writef(STDOUT_FILENO, "╚══════════════════════════════════════════╝\n");
 }
 
@@ -256,11 +265,12 @@ int main(int argc, char *argv[]) {
 
     /* ---- Dashboard ---- */
     g_num_workers = num_prod;
-    g_all_done = 0;
+    g_start_time  = time(NULL);
+    g_all_done    = 0;
     memset(g_lines_done, 0, sizeof(g_lines_done));
     memset(g_lines_total, 0, sizeof(g_lines_total));
 
-    for (int i = 0; i < g_num_workers + 7; i++)
+    for (int i = 0; i < g_num_workers + 8; i++)  /* +1 por causa da linha Elapsed */
         posix_writef(STDOUT_FILENO, "\n");
 
     pthread_t monitor_thread;
@@ -325,7 +335,12 @@ int main(int argc, char *argv[]) {
 
     /* ── 7. Destruir buffer e imprimir relatório ── */
     destroy_bounded_buffer();
+
+    long elapsed = (long)(time(NULL) - g_start_time);
+
     imprimir_relatorio(&global_metrics, modo);
+    posix_writef(STDOUT_FILENO, "Tempo de processamento: %ldmin %02lds\n",
+                 elapsed / 60, elapsed % 60);
 
     /* ── 8. Limpeza de memória ── */
     for (int i = 0; i < total_ficheiros; i++) free(ficheiros[i]);

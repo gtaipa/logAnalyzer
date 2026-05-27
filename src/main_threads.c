@@ -228,7 +228,12 @@ int main(int argc, char *argv[]) {
 
     /* 5. Destruir o trinco e gerar relatório */
     pthread_mutex_destroy(&metrics_mutex);
+
+    long elapsed = (long)(time(NULL) - g_start_time);
+
     gerar_relatorio_threads(&global_metrics, modo, output_file);
+    posix_writef(STDOUT_FILENO, "Tempo de processamento: %ldmin %02lds\n",
+                 elapsed / 60, elapsed % 60);
 
     /* 6. Limpezas */
     for (int i = 0; i < total_ficheiros; i++) free(ficheiros[i]);

@@ -27,6 +27,7 @@
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "ipc.h"
@@ -315,6 +316,8 @@ int main(int argc, char *argv[]) {
 
     fflush(NULL); /* limpar buffers antes do fork para não duplicar output */
 
+    time_t t_inicio = time(NULL);
+
     /* ── 3. Criar os filhos com fork() ── */
     for (int i = 0; i < num_procs; i++) {
         pid_t pid = fork();
@@ -481,7 +484,10 @@ int main(int argc, char *argv[]) {
     }
 
     /* ── 9. Relatório final ── */
+    long elapsed = (long)(time(NULL) - t_inicio);
+
     imprimir_relatorio(&total, modo);
+    printf("Tempo de processamento: %ldmin %02lds\n", elapsed / 60, elapsed % 60);
 
     free(progressos);
     free(client_fds);
