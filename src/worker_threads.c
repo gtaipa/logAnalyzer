@@ -93,26 +93,9 @@ void *run_worker_thread(void *arg) {
     // Forçar os 100% no final para garantir que arredondamentos não falham
     *(t_args->lines_done) = *(t_args->lines_total);
 
-    // 4. Atualizar a variável GLOBAL partilhada por todos, usando o Mutex
+    // 4. Fundir métricas locais no global com deduplicação de IPs
     pthread_mutex_lock(t_args->mutex);
-    
-    t_args->global_metrics->total_lines    += local_metrics.total_lines;
-    t_args->global_metrics->count_debug    += local_metrics.count_debug;
-    t_args->global_metrics->count_info     += local_metrics.count_info;
-    t_args->global_metrics->count_warn     += local_metrics.count_warn;
-    t_args->global_metrics->count_error    += local_metrics.count_error;
-    t_args->global_metrics->count_critical += local_metrics.count_critical;
-    t_args->global_metrics->count_4xx      += local_metrics.count_4xx;
-    t_args->global_metrics->count_5xx      += local_metrics.count_5xx;
-    
-    for (int i = 0; i < local_metrics.ip_num; i++) {
-        if (t_args->global_metrics->ip_num < MAX_IPS) {
-            strncpy(t_args->global_metrics->ip_list[t_args->global_metrics->ip_num], local_metrics.ip_list[i], IP_LEN);
-            t_args->global_metrics->ip_count[t_args->global_metrics->ip_num] = local_metrics.ip_count[i];
-            t_args->global_metrics->ip_num++;
-        }
-    }
-
+    merge_metrics(t_args->global_metrics, &local_metrics);
     pthread_mutex_unlock(t_args->mutex);
 
     pthread_exit(NULL);

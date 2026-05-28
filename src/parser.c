@@ -270,3 +270,35 @@ void update_metrics(Metrics *m, const LogEntry *e) {
 void init_metrics(Metrics *m) {
     memset(m, 0, sizeof(Metrics));
 }
+
+void merge_metrics(Metrics *dst, const Metrics *src) {
+    dst->total_lines    += src->total_lines;
+    dst->count_debug    += src->count_debug;
+    dst->count_info     += src->count_info;
+    dst->count_warn     += src->count_warn;
+    dst->count_error    += src->count_error;
+    dst->count_critical += src->count_critical;
+    dst->count_4xx      += src->count_4xx;
+    dst->count_5xx      += src->count_5xx;
+
+    for (int i = 0; i < src->num_alerts && dst->num_alerts < MAX_ALERTS; i++) {
+        strncpy(dst->alerts[dst->num_alerts], src->alerts[i], ALERT_LEN - 1);
+        dst->alerts[dst->num_alerts][ALERT_LEN - 1] = '\0';
+        dst->num_alerts++;
+    }
+
+    for (int i = 0; i < src->ip_num; i++) {
+        int found = -1;
+        for (int j = 0; j < dst->ip_num; j++) {
+            if (strcmp(dst->ip_list[j], src->ip_list[i]) == 0) { found = j; break; }
+        }
+        if (found >= 0) {
+            dst->ip_count[found] += src->ip_count[i];
+        } else if (dst->ip_num < MAX_IPS) {
+            strncpy(dst->ip_list[dst->ip_num], src->ip_list[i], IP_LEN - 1);
+            dst->ip_list[dst->ip_num][IP_LEN - 1] = '\0';
+            dst->ip_count[dst->ip_num] = src->ip_count[i];
+            dst->ip_num++;
+        }
+    }
+}

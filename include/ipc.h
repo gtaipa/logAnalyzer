@@ -82,4 +82,19 @@ ssize_t writen(int fd, void *ptr, size_t nbytes);
 void run_worker_pipe(char **ficheiros, int total_ficheiros, int pipe_fd_write,
                      int worker_index, off_t byte_inicio, off_t byte_fim, int verbose);
 
+/**
+ * Preenche um WorkerResult a partir das metricas de um worker,
+ * ordenando os IPs e guardando os top 10.
+ */
+void preparar_resultado(const Metrics *m, WorkerResult *r);
+
+/**
+ * Funde um WorkerResult parcial no acumulador total.
+ * ip_list_global/ip_count_global/ip_num_global sao o estado
+ * intermedio partilhado entre todas as chamadas.
+ */
+void acumular_resultado(WorkerResult *total, const WorkerResult *r,
+                        char ip_list_global[256][IP_LEN],
+                        long ip_count_global[256], int *ip_num_global);
+
 #endif /* IPC_H */

@@ -4,7 +4,7 @@
 #include <stdio.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <errno.h> 
+#include <errno.h>
 
 /* =========================================================
  * connect_to_server
@@ -117,4 +117,121 @@ ssize_t writen(int fd, void *ptr, size_t nbytes) {
 
     // 7. Se o ciclo terminou, todos os nbytes foram escritos com sucesso no descritor.
     return (ssize_t)nbytes;
+}
+
+/* =========================================================
+ * preparar_resultado
+ *
+ * Converte as metricas internas de um worker num WorkerResult
+ * pronto a enviar pelo pipe/socket: ordena os IPs por frequencia
+ * e guarda os top 10.
+ * ========================================================= */
+void preparar_resultado(const Metrics *m, WorkerResult *r) {
+    memset(r, 0, sizeof(*r));
+    r->pid            = getpid();
+    r->total_lines    = m->total_lines;
+    r->count_debug    = m->count_debug;
+    r->count_info     = m->count_info;
+    r->count_warn     = m->count_warn;
+    r->count_error    = m->count_error;
+    r->count_critical = m->count_critical;
+    r->count_4xx      = m->count_4xx;
+    r->count_5xx      = m->count_5xx;
+
+    char ips[MAX_IPS][IP_LEN];
+    long counts[MAX_IPS];
+    int n = m->ip_num < MAX_IPS ? m->ip_num : MAX_IPS;
+
+    for (int i = 0; i < n; i++) {
+        strncpy(ips[i], m->ip_list[i], IP_LEN - 1);
+        ips[i][IP_LEN - 1] = '\0';
+        counts[i] = m->ip_count[i];
+    }
+    for (int i = 0; i < n - 1; i++) {
+        for (int j = 0; j < n - i - 1; j++) {
+            if (counts[j] < counts[j + 1]) {
+                long tmp = counts[j]; counts[j] = counts[j + 1]; counts[j + 1] = tmp;
+                char tmp_ip[IP_LEN];
+                strncpy(tmp_ip, ips[j], IP_LEN);
+                strncpy(ips[j], ips[j + 1], IP_LEN);
+                strncpy(ips[j + 1], tmp_ip, IP_LEN);
+            }
+        }
+    }
+    int limite = n < 10 ? n : 10;
+    for (int i = 0; i < limite; i++) {
+        strncpy(r->top_ips[i], ips[i], IP_LEN - 1);
+        r->top_ips[i][IP_LEN - 1] = '\0';
+        r->top_ips_counts[i] = counts[i];
+    }
+    r->num_alerts = m->num_alerts < MAX_ALERTS ? m->num_alerts : MAX_ALERTS;
+    for (int i = 0; i < r->num_alerts; i++) {
+        strncpy(r->alerts[i], m->alerts[i], ALERT_LEN - 1);
+        r->alerts[i][ALERT_LEN - 1] = '\0';
+    }
+}
+
+/* =========================================================
+ * acumular_resultado
+ *
+ * Funde um WorkerResult parcial no total agregado pelo pai.
+ * ip_list_global/ip_count_global/ip_num_global mantêm o estado
+ * entre chamadas sucessivas (uma por worker).
+ * ========================================================= */
+void acumular_resultado(WorkerResult *total, const WorkerResult *r,
+                        char ip_list_global[256][IP_LEN],
+                        long ip_count_global[256], int *ip_num_global) {
+    total->total_lines    += r->total_lines;
+    total->count_debug    += r->count_debug;
+    total->count_info     += r->count_info;
+    total->count_warn     += r->count_warn;
+    total->count_error    += r->count_error;
+    total->count_critical += r->count_critical;
+    total->count_4xx      += r->count_4xx;
+    total->count_5xx      += r->count_5xx;
+
+    for (int k = 0; k < 10; k++) {
+        if (r->top_ips[k][0] == '\0' || r->top_ips_counts[k] <= 0) continue;
+        int found = -1;
+        for (int i = 0; i < *ip_num_global; i++) {
+            if (strcmp(ip_list_global[i], r->top_ips[k]) == 0) { found = i; break; }
+        }
+        if (found == -1 && *ip_num_global < 256) {
+            strncpy(ip_list_global[*ip_num_global], r->top_ips[k], IP_LEN - 1);
+            ip_list_global[*ip_num_global][IP_LEN - 1] = '\0';
+            ip_count_global[*ip_num_global] = r->top_ips_counts[k];
+            (*ip_num_global)++;
+        } else if (found >= 0) {
+            ip_count_global[found] += r->top_ips_counts[k];
+        }
+    }
+
+    for (int i = 0; i < r->num_alerts && total->num_alerts < MAX_ALERTS; i++) {
+        strncpy(total->alerts[total->num_alerts], r->alerts[i], ALERT_LEN - 1);
+        total->alerts[total->num_alerts][ALERT_LEN - 1] = '\0';
+        total->num_alerts++;
+    }
+
+    for (int i = 0; i < *ip_num_global - 1; i++) {
+        for (int j = 0; j < *ip_num_global - i - 1; j++) {
+            if (ip_count_global[j] < ip_count_global[j + 1]) {
+                long tmp = ip_count_global[j];
+                ip_count_global[j] = ip_count_global[j + 1];
+                ip_count_global[j + 1] = tmp;
+                char tmp_ip[IP_LEN];
+                strncpy(tmp_ip, ip_list_global[j], IP_LEN);
+                strncpy(ip_list_global[j], ip_list_global[j + 1], IP_LEN);
+                strncpy(ip_list_global[j + 1], tmp_ip, IP_LEN);
+            }
+        }
+    }
+
+    memset(total->top_ips, 0, sizeof(total->top_ips));
+    memset(total->top_ips_counts, 0, sizeof(total->top_ips_counts));
+    int limite = *ip_num_global < 10 ? *ip_num_global : 10;
+    for (int i = 0; i < limite; i++) {
+        strncpy(total->top_ips[i], ip_list_global[i], IP_LEN - 1);
+        total->top_ips[i][IP_LEN - 1] = '\0';
+        total->top_ips_counts[i] = ip_count_global[i];
+    }
 }

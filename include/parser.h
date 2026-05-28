@@ -111,4 +111,10 @@ LogLevel level_from_string(const char *s);
  */
 int parser_set_mode_from_string(const char *mode_str);
 
+/**
+ * Funde as metricas de *src em *dst, somando contadores e
+ * desduplicando a lista de IPs.
+ */
+void merge_metrics(Metrics *dst, const Metrics *src);
+
 #endif /* PARSER_H */
