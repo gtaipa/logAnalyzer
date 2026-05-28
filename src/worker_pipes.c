@@ -25,6 +25,11 @@ extern volatile int *g_progress;
 
 /* ── Resultado final (enviado uma vez, pelo pipe, no fim) ─────────── */
 
+/**
+ * @brief Serializa as métricas e envia o resultado final pelo pipe para o pai.
+ * @param pipe_fd Descritor de escrita do pipe.
+ * @param m       Métricas acumuladas pelo worker.
+ */
 static void enviar_resultado(int pipe_fd, Metrics *m) {
     int tipo = MSG_RESULTADO;
     write(pipe_fd, &tipo, sizeof(tipo));
@@ -40,6 +45,13 @@ static void enviar_resultado(int pipe_fd, Metrics *m) {
  * dashboard sem custo de I/O no pipe (que fica reservado só para
  * o resultado final).
  * ─────────────────────────────────────────────────────────────────── */
+/**
+ * @brief Actualiza g_progress e envia SIGUSR1 ao pai a cada 10% concluídos.
+ * @param worker_index  Índice deste worker no array g_progress.
+ * @param bytes_feitos  Bytes processados até agora dentro da fatia deste worker.
+ * @param quota         Total de bytes atribuídos a este worker.
+ * @param last_milestone Último marco de 10% já reportado (estado entre chamadas).
+ */
 static inline void notificar_progresso(int worker_index, off_t bytes_feitos,
                                        off_t quota, int *last_milestone) {
     int pct = (quota > 0) ? (int)(bytes_feitos * 100 / quota) : 100;
@@ -55,6 +67,16 @@ static inline void notificar_progresso(int worker_index, off_t bytes_feitos,
 
 /* ── Processamento por fatia de bytes ────────────────────────────── */
 
+/**
+ * @brief Função principal do worker de pipes: processa a fatia de bytes atribuída.
+ * @param ficheiros       Lista completa de ficheiros.
+ * @param total_ficheiros Número total de ficheiros.
+ * @param pipe_fd_write   Extremo de escrita do pipe para enviar o resultado ao pai.
+ * @param worker_index    Índice deste worker (slot em g_progress).
+ * @param byte_inicio     Offset de início da fatia (inclusive).
+ * @param byte_fim        Offset de fim da fatia (exclusive).
+ * @param verbose         1 para imprimir diagnóstico, 0 para silencioso.
+ */
 void run_worker_pipe(char **ficheiros, int total_ficheiros, int pipe_fd_write,
                      int worker_index, off_t byte_inicio, off_t byte_fim, int verbose) {
     Metrics m;

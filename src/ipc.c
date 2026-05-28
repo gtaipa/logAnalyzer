@@ -6,12 +6,12 @@
 #include <sys/un.h>
 #include <errno.h>
 
-/* =========================================================
- * connect_to_server
+/**
+ * @brief Liga ao servidor Unix Domain Socket (usado pelos workers).
+ * @return Descritor do socket ligado, ou -1 em caso de erro persistente.
  *
- * Chamada pelo filho para se ligar ao servidor (pai).
- * Tenta várias vezes caso o pai ainda não esteja pronto.
- * ========================================================= */
+ * Tenta ligar até 10 vezes com espera de 50 ms entre tentativas.
+ */
 int connect_to_server(void) {
 
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -38,13 +38,13 @@ int connect_to_server(void) {
     return -1;
 }
 
-/* =========================================================
- * readn - Le ate nbytes de forma segura a partir de fd.
- *
- * Em pipes e sockets, uma chamada read() pode devolver menos
- * bytes do que os pedidos. Por isso, esta funcao repete read()
- * ate completar nbytes, encontrar EOF, ou detetar erro real.
- * ========================================================= */
+/**
+ * @brief Lê exactamente @p nbytes de @p fd, repetindo read() em leituras parciais ou EINTR.
+ * @param fd     Descritor de ficheiro (pipe ou socket).
+ * @param ptr    Buffer de destino com pelo menos @p nbytes bytes.
+ * @param nbytes Número de bytes a ler.
+ * @return Bytes lidos efectivamente (< nbytes indica EOF prematuro), ou -1 em erro.
+ */
 ssize_t readn(int fd, void *ptr, size_t nbytes) {
     // 1. Preparar o contador de bytes em falta e um ponteiro byte-a-byte para avancar no buffer do chamador.
     size_t nleft = nbytes;
@@ -78,13 +78,13 @@ ssize_t readn(int fd, void *ptr, size_t nbytes) {
     return (ssize_t)(nbytes - nleft);
 }
 
-/* =========================================================
- * writen - Escreve exatamente nbytes de forma segura em fd.
- *
- * Em pipes e sockets, write() tambem pode aceitar apenas parte
- * dos bytes pedidos. Esta funcao continua a escrever ate enviar
- * tudo, ou ate encontrar um erro real que impossibilite continuar.
- * ========================================================= */
+/**
+ * @brief Escreve exactamente @p nbytes em @p fd, repetindo write() em escritas parciais ou EINTR.
+ * @param fd     Descritor de ficheiro (pipe ou socket).
+ * @param ptr    Buffer de origem.
+ * @param nbytes Número de bytes a escrever.
+ * @return @p nbytes em sucesso, ou -1 em erro (incluindo pipe fechado).
+ */
 ssize_t writen(int fd, void *ptr, size_t nbytes) {
     // 1. Preparar o contador de bytes por escrever e um ponteiro para a proxima posicao a enviar.
     size_t nleft = nbytes;
@@ -119,13 +119,11 @@ ssize_t writen(int fd, void *ptr, size_t nbytes) {
     return (ssize_t)nbytes;
 }
 
-/* =========================================================
- * preparar_resultado
- *
- * Converte as metricas internas de um worker num WorkerResult
- * pronto a enviar pelo pipe/socket: ordena os IPs por frequencia
- * e guarda os top 10.
- * ========================================================= */
+/**
+ * @brief Converte as métricas de um worker num WorkerResult pronto a enviar.
+ * @param m Métricas acumuladas pelo worker durante o processamento.
+ * @param r Estrutura de saída preenchida com contadores e top 10 IPs ordenados por frequência.
+ */
 void preparar_resultado(const Metrics *m, WorkerResult *r) {
     memset(r, 0, sizeof(*r));
     r->pid            = getpid();
@@ -171,13 +169,14 @@ void preparar_resultado(const Metrics *m, WorkerResult *r) {
     }
 }
 
-/* =========================================================
- * acumular_resultado
- *
- * Funde um WorkerResult parcial no total agregado pelo pai.
- * ip_list_global/ip_count_global/ip_num_global mantêm o estado
- * entre chamadas sucessivas (uma por worker).
- * ========================================================= */
+/**
+ * @brief Funde o resultado parcial de um worker no total agregado pelo pai.
+ * @param total           Acumulador global actualizado in-place.
+ * @param r               WorkerResult recebido de um worker.
+ * @param ip_list_global  Lista intermédia de IPs únicos (estado persistente entre chamadas).
+ * @param ip_count_global Contagens associadas a ip_list_global.
+ * @param ip_num_global   Número de IPs únicos actualmente em ip_list_global.
+ */
 void acumular_resultado(WorkerResult *total, const WorkerResult *r,
                         char ip_list_global[256][IP_LEN],
                         long ip_count_global[256], int *ip_num_global) {

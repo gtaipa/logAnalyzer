@@ -76,44 +76,55 @@ typedef struct {
  * --------------------------------------------------------- */
 
 /**
- * Deteta o formato de uma linha de log.
- * Retorna o LogFormat correspondente ou FORMAT_UNKNOWN.
+ * @brief Deteta o formato de uma linha de log.
+ * @param line Linha de texto a analisar.
+ * @return O LogFormat correspondente, ou FORMAT_UNKNOWN se não reconhecido.
  */
 LogFormat detect_format(const char *line);
 
 /**
- * Parseia uma linha de acordo com o formato indicado.
- * Preenche *entry e retorna 0 em sucesso, -1 em erro.
+ * @brief Parseia uma linha de acordo com o formato indicado.
+ * @param line   Linha de texto a parsear.
+ * @param format Formato detectado previamente (ex: FORMAT_APACHE).
+ * @param entry  Estrutura de saída preenchida com os dados extraídos.
+ * @return 0 em sucesso, -1 se a linha não puder ser parseada ou não corresponde ao modo activo.
  */
 int parse_line(const char *line, LogFormat format, LogEntry *entry);
 
 /**
- * Acumula os dados de *entry nas métricas *m.
+ * @brief Acumula os dados de uma entrada nas métricas de um worker.
+ * @param m     Métricas acumuladas (modificadas in-place).
+ * @param entry Entrada de log já parseada a acumular.
  */
 void update_metrics(Metrics *m, const LogEntry *entry);
 
 /**
- * Inicializa uma estrutura Metrics a zeros.
+ * @brief Inicializa uma estrutura Metrics a zeros.
+ * @param m Estrutura a inicializar.
  */
 void init_metrics(Metrics *m);
 
 /**
- * Converte uma string de nível ("ERROR", "warn", etc.) para LogLevel.
+ * @brief Converte uma string de nível para LogLevel.
+ * @param s String com o nível (ex: "ERROR", "warn", "CRITICAL").
+ * @return O LogLevel correspondente, ou LEVEL_UNKNOWN se não reconhecido.
  */
 LogLevel level_from_string(const char *s);
 
 /**
- * Define o modo de analise a partir do argumento CLI ("security", "performance",
- * "traffic", "full"). Retorna 0 em sucesso, -1 se a string for invalida.
+ * @brief Define o modo de análise a partir do argumento CLI.
+ * @param mode_str String do modo: "security", "performance", "traffic" ou "full".
+ * @return 0 em sucesso, -1 se a string for inválida.
  *
- * O modo afeta o parse_line(): eventos que nao correspondem ao modo sao
- * ignorados (parse_line retorna -1).
+ * O modo afecta parse_line(): entradas que não correspondem ao modo
+ * activo são ignoradas (parse_line retorna -1).
  */
 int parser_set_mode_from_string(const char *mode_str);
 
 /**
- * Funde as metricas de *src em *dst, somando contadores e
- * desduplicando a lista de IPs.
+ * @brief Funde as métricas de @p src em @p dst, somando contadores e desduplicando IPs.
+ * @param dst Métricas de destino (acumulador global).
+ * @param src Métricas locais do worker a fundir.
  */
 void merge_metrics(Metrics *dst, const Metrics *src);
 

@@ -63,35 +63,59 @@ typedef struct {
  * ========================================================= */
 
 /**
- * Liga ao socket servidor (usado pelos filhos).
- * Retorna o fd do socket ligado, ou -1 em erro.
+ * @brief Liga ao socket servidor (usado pelos filhos/workers).
+ * @return Descritor do socket ligado, ou -1 em caso de erro.
+ *
+ * Tenta ligar até 10 vezes com espera de 50 ms entre tentativas,
+ * para tolerar o tempo de arranque do pai.
  */
 int connect_to_server(void);
 
-/* =========================================================
- * Funções auxiliares seguras para Pipes/Sockets
- *
- * readn() tenta ler exatamente nbytes, repetindo read()
- * quando ha leituras parciais ou interrupcao por sinal.
- *
- * writen() tenta escrever exatamente nbytes, repetindo write()
- * quando ha escritas parciais ou interrupcao por sinal.
- * ========================================================= */
+/**
+ * @brief Lê exactamente @p nbytes de @p fd, repetindo read() se necessário.
+ * @param fd     Descritor de ficheiro (pipe ou socket).
+ * @param ptr    Buffer de destino.
+ * @param nbytes Número exacto de bytes a ler.
+ * @return Número de bytes efectivamente lidos (< nbytes indica EOF prematuro), ou -1 em erro.
+ */
 ssize_t readn(int fd, void *ptr, size_t nbytes);
+
+/**
+ * @brief Escreve exactamente @p nbytes em @p fd, repetindo write() se necessário.
+ * @param fd     Descritor de ficheiro (pipe ou socket).
+ * @param ptr    Buffer de origem.
+ * @param nbytes Número exacto de bytes a escrever.
+ * @return Número de bytes escritos (igual a nbytes em sucesso), ou -1 em erro.
+ */
 ssize_t writen(int fd, void *ptr, size_t nbytes);
+
+/**
+ * @brief Função principal do worker de pipes.
+ * @param ficheiros        Lista de todos os ficheiros a processar.
+ * @param total_ficheiros  Número total de ficheiros.
+ * @param pipe_fd_write    Extremo de escrita do pipe para enviar resultados ao pai.
+ * @param worker_index     Índice deste worker no array de progresso global.
+ * @param byte_inicio      Offset de byte onde este worker começa a processar.
+ * @param byte_fim         Offset de byte onde este worker termina (exclusive).
+ * @param verbose          1 se --verbose foi passado, 0 caso contrário.
+ */
 void run_worker_pipe(char **ficheiros, int total_ficheiros, int pipe_fd_write,
                      int worker_index, off_t byte_inicio, off_t byte_fim, int verbose);
 
 /**
- * Preenche um WorkerResult a partir das metricas de um worker,
- * ordenando os IPs e guardando os top 10.
+ * @brief Converte as métricas internas de um worker num WorkerResult pronto a enviar.
+ * @param m Métricas acumuladas pelo worker.
+ * @param r Estrutura de saída preenchida com contadores e top 10 IPs ordenados.
  */
 void preparar_resultado(const Metrics *m, WorkerResult *r);
 
 /**
- * Funde um WorkerResult parcial no acumulador total.
- * ip_list_global/ip_count_global/ip_num_global sao o estado
- * intermedio partilhado entre todas as chamadas.
+ * @brief Funde um WorkerResult parcial no total agregado pelo processo pai.
+ * @param total           Acumulador total (modificado in-place).
+ * @param r               Resultado parcial de um worker.
+ * @param ip_list_global  Lista intermédia de IPs únicos (estado entre chamadas).
+ * @param ip_count_global Contagens correspondentes aos IPs em ip_list_global.
+ * @param ip_num_global   Número actual de IPs únicos em ip_list_global.
  */
 void acumular_resultado(WorkerResult *total, const WorkerResult *r,
                         char ip_list_global[256][IP_LEN],

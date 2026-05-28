@@ -24,6 +24,11 @@ extern volatile int *g_progress;
 
 /* ── Resultado final ──────────────────────────────────────────────── */
 
+/**
+ * @brief Serializa as métricas e envia o resultado final pelo socket para o pai.
+ * @param sock Descritor do socket ligado ao pai.
+ * @param m    Métricas acumuladas pelo worker.
+ */
 static void enviar_resultado(int sock, Metrics *m) {
     int tipo = MSG_RESULTADO;
     write(sock, &tipo, sizeof(tipo));
@@ -38,6 +43,13 @@ static void enviar_resultado(int sock, Metrics *m) {
  * e envia SIGUSR1 ao pai.  O socket fica reservado apenas para o
  * resultado final.
  * ─────────────────────────────────────────────────────────────────── */
+/**
+ * @brief Actualiza g_progress e envia SIGUSR1 ao pai a cada 10% concluídos.
+ * @param worker_index   Índice deste worker no array g_progress.
+ * @param bytes_feitos   Bytes processados até agora dentro da fatia deste worker.
+ * @param quota          Total de bytes atribuídos a este worker.
+ * @param last_milestone Último marco de 10% já reportado (estado entre chamadas).
+ */
 static inline void notificar_progresso(int worker_index, off_t bytes_feitos,
                                        off_t quota, int *last_milestone) {
     int pct = (quota > 0) ? (int)(bytes_feitos * 100 / quota) : 100;
@@ -53,6 +65,16 @@ static inline void notificar_progresso(int worker_index, off_t bytes_feitos,
 
 /* ── Processamento por fatia de bytes ────────────────────────────── */
 
+/**
+ * @brief Processa a fatia de bytes [byte_inicio, byte_fim) sobre a lista de ficheiros.
+ * @param ficheiros       Lista completa de ficheiros.
+ * @param total_ficheiros Número total de ficheiros.
+ * @param m               Métricas a acumular (modificadas in-place).
+ * @param worker_index    Índice deste worker (para g_progress e logs verbose).
+ * @param byte_inicio     Offset global de início (inclusive).
+ * @param byte_fim        Offset global de fim (exclusive).
+ * @param verbose         1 para imprimir diagnóstico, 0 para silencioso.
+ */
 static void processar_por_bytes(char **ficheiros, int total_ficheiros, Metrics *m,
                                 int worker_index, off_t byte_inicio, off_t byte_fim,
                                 int verbose) {
@@ -148,6 +170,14 @@ static void processar_por_bytes(char **ficheiros, int total_ficheiros, Metrics *
 
 /* ── Função principal do worker (sockets) ────────────────────────── */
 
+/**
+ * @brief Função principal do worker de sockets: liga ao pai, recebe config e processa.
+ * @param ficheiros            Lista completa de ficheiros.
+ * @param total_ficheiros      Número total de ficheiros.
+ * @param num_processos        Número total de workers (não usado directamente).
+ * @param worker_index_original Índice inicial (substituído pelo índice recebido via MSG_CONFIG).
+ * @param verbose              1 para imprimir diagnóstico, 0 para silencioso.
+ */
 void run_worker(char **ficheiros, int total_ficheiros, int num_processos,
                 int worker_index_original, int verbose) {
     (void)num_processos;

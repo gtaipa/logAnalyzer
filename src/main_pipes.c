@@ -34,6 +34,10 @@ void run_worker_pipe(char **ficheiros, int total_ficheiros, int pipe_fd_write,
 volatile int            *g_progress = NULL;
 static volatile sig_atomic_t g_redraw  = 0;
 
+/**
+ * @brief Handler de SIGUSR1: activa a flag g_redraw para o loop principal redesenhar o dashboard.
+ * @param sig Número do sinal (não usado).
+ */
 static void handler_sigusr1(int sig) {
     (void)sig;
     g_redraw = 1;
@@ -41,6 +45,13 @@ static void handler_sigusr1(int sig) {
 
 /* ── Dashboard ────────────────────────────────────────────────────── */
 
+/**
+ * @brief Redesenha o dashboard de progresso no terminal.
+ * @param num_workers Número de workers (linhas a redesenhar).
+ *
+ * Usa sequências ANSI para subir o cursor e sobrescrever as linhas existentes.
+ * Lê as percentagens directamente de g_progress[].
+ */
 static void desenhar_dashboard(int num_workers) {
     printf("\033[%dA", num_workers);
     printf("\033[J");
@@ -62,12 +73,23 @@ static void desenhar_dashboard(int num_workers) {
 
 /* ── Utilitários ──────────────────────────────────────────────────── */
 
+/**
+ * @brief Liberta o array de strings de caminhos de ficheiros.
+ * @param ficheiros       Array de strings a libertar.
+ * @param total_ficheiros Número de entradas no array.
+ */
 static void libertar_ficheiros(char **ficheiros, int total_ficheiros) {
     if (ficheiros == NULL) return;
     for (int i = 0; i < total_ficheiros; i++) free(ficheiros[i]);
     free(ficheiros);
 }
 
+/**
+ * @brief Calcula o total de bytes de todos os ficheiros usando stat().
+ * @param ficheiros       Lista de caminhos de ficheiros.
+ * @param total_ficheiros Número de ficheiros.
+ * @return Soma dos tamanhos em bytes.
+ */
 static off_t obter_bytes_totais(char **ficheiros, int total_ficheiros) {
     off_t total = 0;
     struct stat st;
@@ -78,6 +100,11 @@ static off_t obter_bytes_totais(char **ficheiros, int total_ficheiros) {
     return total;
 }
 
+/**
+ * @brief Converte e valida o argumento CLI de número de processos.
+ * @param texto String numérica do argumento (ex: "4").
+ * @return Número inteiro positivo, ou termina o processo em caso de valor inválido.
+ */
 static int converter_num_processos(const char *texto) {
     char *fim = NULL;
     errno = 0;
@@ -89,6 +116,11 @@ static int converter_num_processos(const char *texto) {
     return (int)valor;
 }
 
+/**
+ * @brief Imprime o relatório final agregado de todos os workers.
+ * @param total Resultado total acumulado.
+ * @param modo  Modo de análise usado (ex: "full", "security").
+ */
 static void imprimir_relatorio(const WorkerResult *total, char *modo) {
     printf("\n=== RELATORIO FINAL (%s) ===\n", modo);
     printf("Total de linhas  : %ld\n", total->total_lines);

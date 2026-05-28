@@ -6,17 +6,16 @@
  * ========================================================= */
 
 /**
- * Função principal do processo filho.
+ * @brief Função principal do processo filho (variante sockets).
+ * @param ficheiros        Lista completa de ficheiros a processar.
+ * @param total_ficheiros  Número total de ficheiros.
+ * @param num_processos    Número total de workers lançados pelo pai.
+ * @param worker_index     Índice deste worker (usado internamente; o índice real vem via MSG_CONFIG).
+ * @param verbose          1 se --verbose foi passado, 0 caso contrário.
  *
- * @param ficheiros        lista completa de ficheiros
- * @param total_ficheiros  número total de ficheiros
- * @param num_processos    número total de processos (workers)
- * @param worker_index     índice deste worker (0, 1, 2, ...)
- * @param verbose          1 se --verbose foi passado, 0 caso contrário
- *
- * O filho liga-se ao pai via Unix Domain Socket (SOCKET_PATH),
- * recebe a configuração (intervalo de linhas) e processa sua quota.
- * Envia ProgressUpdates + WorkerResult pelo mesmo socket.
+ * O filho liga-se ao servidor (pai) via Unix Domain Socket, recebe a
+ * configuração (byte_inicio, byte_fim), processa a sua fatia e envia
+ * o WorkerResult final pelo socket.
  */
 void run_worker(char **ficheiros, int total_ficheiros, int num_processos,
                 int worker_index, int verbose);

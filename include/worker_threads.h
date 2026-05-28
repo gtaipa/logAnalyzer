@@ -20,7 +20,14 @@ typedef struct {
     long *lines_total;        // Apontador para partilhar o total de linhas a ler
 } ThreadArgs;
 
-/* Protótipo da função que a thread vai executar */
+/**
+ * @brief Função executada por cada thread worker.
+ * @param arg Apontador para ThreadArgs com o subconjunto de ficheiros e estado partilhado.
+ * @return NULL (usa pthread_exit internamente).
+ *
+ * Processa os ficheiros atribuídos, acumula métricas locais e funde-as
+ * na estrutura global com mutex antes de terminar.
+ */
 void *run_worker_thread(void *arg);
 
 #endif /* WORKER_THREADS_H */

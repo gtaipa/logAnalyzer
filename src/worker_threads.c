@@ -11,6 +11,14 @@
 #define BUF_SIZE 4096
 #define LINE_MAX 512
 
+/**
+ * @brief Processa um ficheiro completo e acumula métricas nas métricas locais da thread.
+ * @param path         Caminho do ficheiro a processar.
+ * @param local_m      Métricas locais desta thread (modificadas in-place).
+ * @param verbose      1 para imprimir o nome do ficheiro ao abrir, 0 para silencioso.
+ * @param worker_index Índice da thread (usado em mensagens verbose).
+ * @param bytes_done   Contador de bytes lidos partilhado com o dashboard (incrementado aqui).
+ */
 static void process_file_thread(const char *path, Metrics *local_m, int verbose, int worker_index, long *bytes_done) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) { perror("open"); return; }
@@ -52,6 +60,14 @@ static void process_file_thread(const char *path, Metrics *local_m, int verbose,
     close(fd);
 }
 
+/**
+ * @brief Função executada por cada thread worker de processamento.
+ * @param arg Apontador para ThreadArgs com subconjunto de ficheiros e estado partilhado.
+ * @return NULL.
+ *
+ * Processa os ficheiros atribuídos em local_metrics, depois funde os
+ * resultados no acumulador global com merge_metrics() sob mutex.
+ */
 void *run_worker_thread(void *arg) {
     ThreadArgs *t_args = (ThreadArgs *)arg;
     

@@ -42,10 +42,35 @@ extern LogQueue        buffer;
 extern int             produtores_ativos;
 extern pthread_mutex_t metrics_mutex;
 
-/* ---- Funções ---- */
+/**
+ * @brief Inicializa o buffer circular, mutex e semáforos.
+ */
 void  init_bounded_buffer(void);
+
+/**
+ * @brief Destrói o mutex e os semáforos do buffer circular.
+ */
 void  destroy_bounded_buffer(void);
+
+/**
+ * @brief Função executada por cada thread produtora.
+ * @param arg Apontador para ProducerArgs com o subconjunto de ficheiros.
+ * @return NULL.
+ *
+ * Lê os ficheiros linha a linha, parseia cada linha e insere LogEntry
+ * válidas no buffer circular. Ao terminar decrementa produtores_ativos
+ * e acorda os consumidores bloqueados.
+ */
 void *run_producer(void *arg);
+
+/**
+ * @brief Função executada por cada thread consumidora.
+ * @param arg Apontador para ConsumerArgs com as métricas globais e o mutex.
+ * @return NULL.
+ *
+ * Retira LogEntry do buffer circular e chama update_metrics() enquanto
+ * houver produtores activos ou entradas por processar.
+ */
 void *run_consumer(void *arg);
 
 #endif /* WORKER_PRODCONS_H */

@@ -44,6 +44,13 @@ static volatile int g_all_done = 0;
 /* =========================================================
  * imprimir_relatorio — atualizado com suporte a modos
  * ========================================================= */
+/**
+ * @brief Imprime o relatório final do produtor-consumidor filtrado pelo modo.
+ * @param m    Métricas globais acumuladas pelos consumidores.
+ * @param modo Modo de análise ("security", "performance", "traffic", "full").
+ *
+ * Ordena os IPs por frequência (bubble sort in-place) antes de imprimir o top 10.
+ */
 static void imprimir_relatorio(Metrics *m, char *modo) {
 
     posix_writef(STDOUT_FILENO, "\n=== RELATORIO FINAL PRODCONS (%s) ===\n", modo);
@@ -118,6 +125,11 @@ static void imprimir_relatorio(Metrics *m, char *modo) {
 /* =========================================================
  * draw_dashboard / run_monitor_thread
  * ========================================================= */
+/**
+ * @brief Redesenha o dashboard de progresso dos produtores no terminal.
+ *
+ * Lê g_lines_done[] e g_lines_total[] e calcula o tempo decorrido desde g_start_time.
+ */
 static void draw_dashboard(void) {
     int linhas = g_num_workers + 8;  /* +1 por causa da linha Elapsed */
     posix_writef(STDOUT_FILENO, "\033[%dA", linhas);
@@ -169,6 +181,11 @@ static void draw_dashboard(void) {
     posix_writef(STDOUT_FILENO, "╚══════════════════════════════════════════╝\n");
 }
 
+/**
+ * @brief Thread monitora: redesenha o dashboard a cada 100 ms até g_all_done ser 1.
+ * @param arg Não utilizado.
+ * @return NULL.
+ */
 void *run_monitor_thread(void *arg) {
     (void)arg;
     while (!g_all_done) {

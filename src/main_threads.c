@@ -20,7 +20,12 @@ static time_t g_start_time   = 0;
 static volatile int g_all_done = 0; // Flag para parar a thread monitora
 static int    g_dashboard_enabled = 0;
 
-/* Função que desenha a interface (idêntica aos sockets) */
+/**
+ * @brief Redesenha o dashboard de progresso das threads no terminal.
+ *
+ * Lê g_lines_done[] e g_lines_total[] para calcular as percentagens.
+ * Usa sequências ANSI para sobrescrever as linhas anteriores.
+ */
 static void draw_dashboard(void) {
     int linhas = g_num_workers + 7;
     posix_writef(STDOUT_FILENO, "\033[%dA", linhas); // Move o cursor para cima
@@ -69,6 +74,11 @@ static void draw_dashboard(void) {
 }
 
 /* Thread Monitora: Fica em loop a desenhar o dashboard até os workers acabarem */
+/**
+ * @brief Thread monitora: redesenha o dashboard a cada 100 ms até g_all_done ser 1.
+ * @param arg Não utilizado.
+ * @return NULL.
+ */
 void *run_monitor_thread(void *arg) {
     (void)arg;
     while (!g_all_done) {
@@ -79,6 +89,12 @@ void *run_monitor_thread(void *arg) {
     pthread_exit(NULL);
 }
 
+/**
+ * @brief Gera o relatório final das threads, opcionalmente para ficheiro.
+ * @param total       Métricas globais acumuladas por todas as threads.
+ * @param modo        Modo de análise ("security", "traffic", "performance", "full").
+ * @param output_file Caminho do ficheiro de saída, ou NULL para escrever em stdout.
+ */
 void gerar_relatorio_threads(Metrics *total, char *modo, char *output_file) {
     int fd_out = STDOUT_FILENO;
     int fd_file = -1;

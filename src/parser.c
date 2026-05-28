@@ -11,6 +11,11 @@
 
 static AnalysisMode g_mode = MODE_FULL;
 
+/**
+ * @brief Converte severidade numérica (classifier) em LogLevel.
+ * @param severity Nível numérico (0=INFO, 2=WARN, 3=ERROR, 4=CRITICAL).
+ * @return O LogLevel correspondente.
+ */
 static LogLevel level_from_severity(int severity) {
     switch (severity) {
         case 0: return LEVEL_INFO;
@@ -22,6 +27,11 @@ static LogLevel level_from_severity(int severity) {
     }
 }
 
+/**
+ * @brief Converte o nível numérico de um log JSON em LogLevel.
+ * @param json_level Constante definida em log_parser.h (LOG_DEBUG, LOG_INFO, etc.).
+ * @return O LogLevel correspondente.
+ */
 static LogLevel level_from_json_level(int json_level) {
     switch (json_level) {
         case LOG_DEBUG: return LEVEL_DEBUG;
@@ -33,6 +43,12 @@ static LogLevel level_from_json_level(int json_level) {
     }
 }
 
+/**
+ * @brief Preenche entry->message com description ou fallback se description estiver vazio.
+ * @param entry       Entrada de log cujo campo message será preenchido.
+ * @param description Texto preferencial (pode ser NULL ou vazio).
+ * @param fallback    Texto alternativo se description não estiver disponível.
+ */
 static void copy_description_or_fallback(LogEntry *entry, const char *description, const char *fallback) {
     const char *text = (description && description[0] != '\0') ? description : fallback;
     if (text == NULL || text[0] == '\0') text = "Evento critico sem descricao";
@@ -41,6 +57,12 @@ static void copy_description_or_fallback(LogEntry *entry, const char *descriptio
     entry->message[MSG_LEN - 1] = '\0';
 }
 
+/**
+ * @brief Extrai o primeiro endereço IPv4 válido encontrado na string @p s.
+ * @param s   String a pesquisar.
+ * @param out Buffer de saída de tamanho IP_LEN onde o IP é escrito.
+ * @return 0 se encontrou um IP válido, -1 caso contrário.
+ */
 static int extract_ipv4(const char *s, char out[IP_LEN]) {
     if (!s) return -1;
     out[0] = '\0';
@@ -59,6 +81,11 @@ static int extract_ipv4(const char *s, char out[IP_LEN]) {
     return -1;
 }
 
+/**
+ * @brief Salta a prioridade no formato syslog (<N>) no início de uma linha.
+ * @param line Linha de syslog.
+ * @return Apontador para o carácter após ">", ou para @p line se não houver prioridade.
+ */
 static const char *skip_syslog_priority(const char *line) {
     const char *p = line;
 
@@ -78,6 +105,11 @@ static const char *skip_syslog_priority(const char *line) {
     return *p == '>' ? p + 1 : line;
 }
 
+/**
+ * @brief Verifica heuristicamente se uma linha começa com um timestamp syslog ("Mmm DD").
+ * @param line Linha a verificar.
+ * @return 1 se parecer ter timestamp syslog, 0 caso contrário.
+ */
 static int looks_like_syslog_timestamp(const char *line) {
     return strlen(line) > 15 &&
            isalpha((unsigned char)line[0]) &&
@@ -87,6 +119,11 @@ static int looks_like_syslog_timestamp(const char *line) {
            (isdigit((unsigned char)line[4]) || line[4] == ' ');
 }
 
+/**
+ * @brief Define o modo de análise global a partir de uma string CLI.
+ * @param mode_str "security", "performance", "traffic" ou "full".
+ * @return 0 em sucesso, -1 se a string for inválida.
+ */
 int parser_set_mode_from_string(const char *mode_str) {
     if (!mode_str) return -1;
     if (strcasecmp(mode_str, "security") == 0) g_mode = MODE_SECURITY;
@@ -97,6 +134,11 @@ int parser_set_mode_from_string(const char *mode_str) {
     return 0;
 }
 
+/**
+ * @brief Converte uma string de nível textual em LogLevel (case-insensitive).
+ * @param s String a converter (ex: "ERROR", "warn", "CRIT").
+ * @return LogLevel correspondente, ou LEVEL_UNKNOWN se não reconhecido.
+ */
 LogLevel level_from_string(const char *s) {
     if (s == NULL) return LEVEL_UNKNOWN;
 
@@ -119,6 +161,11 @@ LogLevel level_from_string(const char *s) {
     return LEVEL_UNKNOWN;
 }
 
+/**
+ * @brief Deteta o formato de uma linha de log por heurística.
+ * @param line Linha de texto a analisar.
+ * @return FORMAT_JSON, FORMAT_APACHE, FORMAT_NGINX_ERROR, FORMAT_SYSLOG, ou FORMAT_UNKNOWN.
+ */
 LogFormat detect_format(const char *line) {
     if (line == NULL || *line == '\0') return FORMAT_UNKNOWN;
     if (line[0] == '{') return FORMAT_JSON;
@@ -162,6 +209,13 @@ LogFormat detect_format(const char *line) {
     return FORMAT_UNKNOWN;
 }
 
+/**
+ * @brief Parseia uma linha de log e preenche uma LogEntry.
+ * @param line   Linha de texto (sem newline).
+ * @param format Formato da linha (detectado previamente com detect_format).
+ * @param entry  Estrutura de saída preenchida em caso de sucesso.
+ * @return 0 em sucesso, -1 se a linha não for válida ou não corresponder ao modo activo.
+ */
 int parse_line(const char *line, LogFormat format, LogEntry *entry) {
     if (line == NULL || entry == NULL) return -1;
 
@@ -227,6 +281,11 @@ int parse_line(const char *line, LogFormat format, LogEntry *entry) {
     }
 }
 //NO FIM ATUALIZA AS METRICAS COM O LOG ENTRY PARSEADO, SE O LOG ENTRY FOR VALIDO E CORRESPONDER AO MODO DE ANALISE ATUAL
+/**
+ * @brief Acumula os dados de uma LogEntry nas métricas do worker.
+ * @param m Acumulador de métricas (modificado in-place).
+ * @param e Entrada de log a acumular (contadores, IP, alertas).
+ */
 void update_metrics(Metrics *m, const LogEntry *e) {
     m->total_lines++;
 
@@ -267,10 +326,19 @@ void update_metrics(Metrics *m, const LogEntry *e) {
     }
 }
 
+/**
+ * @brief Inicializa uma estrutura Metrics a zeros.
+ * @param m Estrutura a inicializar.
+ */
 void init_metrics(Metrics *m) {
     memset(m, 0, sizeof(Metrics));
 }
 
+/**
+ * @brief Funde as métricas de @p src em @p dst com deduplicação de IPs.
+ * @param dst Acumulador global (modificado in-place).
+ * @param src Métricas locais do worker a fundir.
+ */
 void merge_metrics(Metrics *dst, const Metrics *src) {
     dst->total_lines    += src->total_lines;
     dst->count_debug    += src->count_debug;
