@@ -89,6 +89,63 @@ static int converter_num_processos(const char *texto) {
     return (int)valor;
 }
 
+static void acumular_resultado(WorkerResult *total, const WorkerResult *r,
+                               char ip_list_global[256][IP_LEN], long ip_count_global[256], int *ip_num_global) {
+    total->total_lines += r->total_lines;
+    total->count_debug += r->count_debug;
+    total->count_info  += r->count_info;
+    total->count_warn  += r->count_warn;
+    total->count_error += r->count_error;
+    total->count_critical += r->count_critical;
+    total->count_4xx   += r->count_4xx;
+    total->count_5xx   += r->count_5xx;
+
+    for (int k = 0; k < 10; k++) {
+        if (r->top_ips[k][0] == '\0' || r->top_ips_counts[k] <= 0) continue;
+        int found = -1;
+        for (int i = 0; i < *ip_num_global; i++) {
+            if (strcmp(ip_list_global[i], r->top_ips[k]) == 0) { found = i; break; }
+        }
+        if (found == -1 && *ip_num_global < 256) {
+            strncpy(ip_list_global[*ip_num_global], r->top_ips[k], IP_LEN - 1);
+            ip_list_global[*ip_num_global][IP_LEN - 1] = '\0';
+            ip_count_global[*ip_num_global] = r->top_ips_counts[k];
+            (*ip_num_global)++;
+        } else if (found >= 0) {
+            ip_count_global[found] += r->top_ips_counts[k];
+        }
+    }
+
+    for (int i = 0; i < r->num_alerts && total->num_alerts < MAX_ALERTS; i++) {
+        strncpy(total->alerts[total->num_alerts], r->alerts[i], ALERT_LEN - 1);
+        total->alerts[total->num_alerts][ALERT_LEN - 1] = '\0';
+        total->num_alerts++;
+    }
+
+    for (int i = 0; i < *ip_num_global - 1; i++) {
+        for (int j = 0; j < *ip_num_global - i - 1; j++) {
+            if (ip_count_global[j] < ip_count_global[j + 1]) {
+                long tmp = ip_count_global[j];
+                ip_count_global[j] = ip_count_global[j + 1];
+                ip_count_global[j + 1] = tmp;
+                char tmp_ip[IP_LEN];
+                strncpy(tmp_ip, ip_list_global[j], IP_LEN);
+                strncpy(ip_list_global[j], ip_list_global[j + 1], IP_LEN);
+                strncpy(ip_list_global[j + 1], tmp_ip, IP_LEN);
+            }
+        }
+    }
+
+    memset(total->top_ips, 0, sizeof(total->top_ips));
+    memset(total->top_ips_counts, 0, sizeof(total->top_ips_counts));
+    int limite = *ip_num_global < 10 ? *ip_num_global : 10;
+    for (int i = 0; i < limite; i++) {
+        strncpy(total->top_ips[i], ip_list_global[i], IP_LEN - 1);
+        total->top_ips[i][IP_LEN - 1] = '\0';
+        total->top_ips_counts[i] = ip_count_global[i];
+    }
+}
+
 static void imprimir_relatorio(const WorkerResult *total, char *modo) {
     printf("\n=== RELATORIO FINAL (%s) ===\n", modo);
     printf("Total de linhas  : %ld\n", total->total_lines);
