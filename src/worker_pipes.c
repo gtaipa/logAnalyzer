@@ -14,10 +14,15 @@
 
 #define BUF_SIZE       4096
 #define LINE_MAX_LOCAL 512
-
+//test
 #define MSG_PROGRESSO 1
 #define MSG_RESULTADO 2
 
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Funções para enviar mensagens ao pai via pipe
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+/* Envia atualização de progresso ao pai */
 static void enviar_progresso(int pipe_fd, int worker_index, long bytes_done, long bytes_total) {
     int tipo = MSG_PROGRESSO;
     write(pipe_fd, &tipo, sizeof(tipo));
@@ -30,6 +35,7 @@ static void enviar_progresso(int pipe_fd, int worker_index, long bytes_done, lon
     write(pipe_fd, &pu, sizeof(pu));
 }
 
+/* Prepara o resultado final para envio ao pai */
 static void preparar_resultado(const Metrics *m, WorkerResult *r) {
     memset(r, 0, sizeof(*r));
     r->pid            = getpid();
@@ -82,6 +88,7 @@ static void preparar_resultado(const Metrics *m, WorkerResult *r) {
     }
 }
 
+/* Envia resultado final ao pai */
 static void enviar_resultado(int pipe_fd, Metrics *m) {
     int tipo = MSG_RESULTADO;
     write(pipe_fd, &tipo, sizeof(tipo));
@@ -92,12 +99,10 @@ static void enviar_resultado(int pipe_fd, Metrics *m) {
 }
 
 /*
- * run_worker_pipe — Processa a fatia [byte_inicio, byte_fim) do conjunto de ficheiros.
+ * run_worker_pipe - Processa a fatia [byte_inicio, byte_fim) de ficheiros
  *
- * Em vez de contar linhas e re-ler desde o início, usa stat() para obter tamanhos
- * e lseek() para saltar diretamente para o offset certo dentro de cada ficheiro.
- * Ao chegar ao início de uma fatia interior a um ficheiro, avança até ao próximo
- * '\n' para garantir que processamos apenas linhas completas.
+ * Utiliza lseek() para saltar diretamente para o offset certo em cada ficheiro.
+ * Garante processamento de apenas linhas completas (evita fragmentação entre workers).
  */
 void run_worker_pipe(char **ficheiros, int total_ficheiros, int pipe_fd_write,
                      int worker_index, off_t byte_inicio, off_t byte_fim, int verbose) {

@@ -3,9 +3,10 @@
 #include <ctype.h>
 
 // ============================================================================
-// PARSER: Apache Combined Log (SEM REGEX)
+// PARSER: Apache Combined Log (SEM REGEX) - Extrai campos de logs Apache
 // ============================================================================
 
+/* Parser para formato Apache Combined Log sem expressões regulares */
 int parse_apache_log(const char* line, ApacheLogEntry* entry) {
     if (!line || !entry) return -1;
     

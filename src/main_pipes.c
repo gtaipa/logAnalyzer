@@ -23,6 +23,7 @@
 void run_worker_pipe(char **ficheiros, int total_ficheiros, int pipe_fd_write,
                      int worker_index, off_t byte_inicio, off_t byte_fim, int verbose);
 
+/* Desenha dashboard mostrando progresso de cada worker */
 static void desenhar_dashboard(ProgressUpdate *progressos, int num_workers) {
     printf("\033[%dA", num_workers);
     printf("\033[J");
@@ -46,12 +47,14 @@ static void desenhar_dashboard(ProgressUpdate *progressos, int num_workers) {
     fflush(stdout);
 }
 
+/* Liberta memoria alocada para lista de ficheiros */
 static void libertar_ficheiros(char **ficheiros, int total_ficheiros) {
     if (ficheiros == NULL) return;
     for (int i = 0; i < total_ficheiros; i++) free(ficheiros[i]);
     free(ficheiros);
 }
 
+/* Obtem tamanho total em bytes de todos os ficheiros */
 static off_t obter_bytes_totais(char **ficheiros, int total_ficheiros) {
     off_t total = 0;
     struct stat st;
@@ -62,6 +65,7 @@ static off_t obter_bytes_totais(char **ficheiros, int total_ficheiros) {
     return total;
 }
 
+/* Converte argumento de linha de comando em numero de processos */
 static int converter_num_processos(const char *texto) {
     char *fim = NULL;
     errno = 0;
@@ -73,6 +77,7 @@ static int converter_num_processos(const char *texto) {
     return (int)valor;
 }
 
+/* Acumula resultados de um worker aos resultados globais */
 static void acumular_resultado(WorkerResult *total, const WorkerResult *r, 
                                char ip_list_global[256][IP_LEN], long ip_count_global[256], int *ip_num_global) {
     total->total_lines += r->total_lines;

@@ -3,18 +3,19 @@
 #include "event_classifier.h"
 #include <string.h>
 #include <strings.h>
-#include <stdarg.h> 
+#include <stdarg.h>
 
-// Função auxiliar para copiar timestamp sem modificar const
+/* Função auxiliar para fazer mktime sem modificar const struct tm */
 static time_t safe_mktime(const struct tm* tm) {
     struct tm tmp = *tm;
     return mktime(&tmp);
 }
 
 // ============================================================================
-// CLASSIFICAÇÃO APACHE
+// CLASSIFICAÇÃO APACHE - Detecta e classifica eventos de segurança/performa
 // ============================================================================
 
+/* Classifica entradas Apache detectando padrões de ataque e performance */
 int classify_apache_event(const ApacheLogEntry* entry, ClassifiedEvent* event) {
     if (!entry || !event) return 0;
     

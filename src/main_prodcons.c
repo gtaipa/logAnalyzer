@@ -33,7 +33,7 @@
 #include "posix_io.h"
 #include "worker_prodcons.h"
 
-/* ---- Dashboard ---- */
+/* Dashboard com atualizacoes de progresso */
 #define MAX_WORKERS 64
 static long   g_lines_done[MAX_WORKERS];
 static long   g_lines_total[MAX_WORKERS];
@@ -41,14 +41,13 @@ static int    g_num_workers  = 0;
 static time_t g_start_time   = 0;
 static volatile int g_all_done = 0;
 
-/* ALTERAÇÃO: Número de consumidores fixo em 2.
- * O enunciado não especifica — usamos 2 para demonstrar que o padrão
- * funciona com múltiplos consumidores em simultâneo. */
+/* Numero de consumidores fixo em 2 para demonstrar multiplos consumidores */
 #define NUM_CONSUMERS 2
 
 /* =========================================================
- * imprimir_relatorio — atualizado com suporte a modos
+ * imprimir_relatorio - Gera relatorio com estatisticas de analise
  * ========================================================= */
+/* Imprime relatorio final com metricas coletadas */
 static void imprimir_relatorio(Metrics *m, char *modo) {
 
     posix_writef(STDOUT_FILENO, "\n=== RELATORIO FINAL PRODCONS (%s) ===\n", modo);

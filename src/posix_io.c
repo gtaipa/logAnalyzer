@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <unistd.h>
 
+/* Escreve todos os bytes de forma segura em um file descriptor (trata write parcial) */
 static ssize_t posix_write_all(int fd, const char *buffer, size_t len) {
     size_t total = 0;
 
@@ -22,6 +23,7 @@ static ssize_t posix_write_all(int fd, const char *buffer, size_t len) {
     return (ssize_t)total;
 }
 
+/* Escreve uma string formatada de forma segura (printf-like) para um fd */
 ssize_t posix_writef(int fd, const char *fmt, ...) {
     char buffer[4096];
     va_list args;

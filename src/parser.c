@@ -9,8 +9,10 @@
 #include <string.h>
 #include <strings.h>
 
+/* Modo de análise global para filtrar eventos */
 static AnalysisMode g_mode = MODE_FULL;
 
+/* Converte severity (0-4) para LogLevel correspondente */
 static LogLevel level_from_severity(int severity) {
     switch (severity) {
         case 0: return LEVEL_INFO;
@@ -87,6 +89,7 @@ static int looks_like_syslog_timestamp(const char *line) {
            (isdigit((unsigned char)line[4]) || line[4] == ' ');
 }
 
+/* Configura o modo de análise a partir de uma string */
 int parser_set_mode_from_string(const char *mode_str) {
     if (!mode_str) return -1;
     if (strcasecmp(mode_str, "security") == 0) g_mode = MODE_SECURITY;
@@ -97,6 +100,7 @@ int parser_set_mode_from_string(const char *mode_str) {
     return 0;
 }
 
+/* Converte string em LogLevel */
 LogLevel level_from_string(const char *s) {
     if (s == NULL) return LEVEL_UNKNOWN;
 

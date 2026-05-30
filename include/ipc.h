@@ -8,7 +8,7 @@
 #include "parser.h"  /* IP_LEN */
 
 /* =========================================================
- * Path do socket Unix Domain
+ * Path do socket Unix Domain para comunicação pai-filho
  * ========================================================= */
 #define SOCKET_PATH "/tmp/loganalyzer.sock"
 

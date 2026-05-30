@@ -7,10 +7,10 @@
 #include <errno.h> 
 
 /* =========================================================
- * connect_to_server
+ * connect_to_server - Liga-se ao servidor (pai) via Unix Domain Socket
  *
- * Chamada pelo filho para se ligar ao servidor (pai).
- * Tenta várias vezes caso o pai ainda não esteja pronto.
+ * Utilizado pelo filho para estabelecer comunicação com o pai.
+ * Tenta várias vezes para aguardar que o pai esteja pronto.
  * ========================================================= */
 int connect_to_server(void) {
 

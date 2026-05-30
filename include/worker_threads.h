@@ -20,7 +20,7 @@ typedef struct {
     long *lines_total;        // Apontador para partilhar o total de linhas a ler
 } ThreadArgs;
 
-/* Protótipo da função que a thread vai executar */
+/* Função executada por cada thread worker para processar ficheiros de logs */
 void *run_worker_thread(void *arg);
 
 #endif /* WORKER_THREADS_H */

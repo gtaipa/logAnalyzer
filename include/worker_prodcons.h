@@ -43,9 +43,13 @@ extern int             produtores_ativos;
 extern pthread_mutex_t metrics_mutex;
 
 /* ---- Funções ---- */
+/* Inicializa o buffer circular com mutex e semáforos */
 void  init_bounded_buffer(void);
+/* Destrói o buffer circular e liberta recursos */
 void  destroy_bounded_buffer(void);
+/* Função de thread produtor para ler logs e inserir no buffer */
 void *run_producer(void *arg);
+/* Função de thread consumidor para processar logs do buffer */
 void *run_consumer(void *arg);
 
 #endif /* WORKER_PRODCONS_H */

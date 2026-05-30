@@ -11,7 +11,7 @@
 #define BUF_SIZE 4096
 #define LINE_MAX 512
 
-/* Função para estimar o total de linhas rapidamente */
+/* Conta rapidamente o número de linhas em um ficheiro (para dashboard) */
 static long count_lines(const char *path) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) return 0;
@@ -27,6 +27,7 @@ static long count_lines(const char *path) {
     return count;
 }
 
+/* Processa um ficheiro de logs, parseia linhas e atualiza métricas locais */
 static void process_file_thread(const char *path, Metrics *local_m, int verbose, int worker_index, long *lines_done) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) { perror("open"); return; }
@@ -70,6 +71,7 @@ static void process_file_thread(const char *path, Metrics *local_m, int verbose,
     close(fd);
 }
 
+/* Função principal de cada thread worker: processa ficheiros atribuídos e agrega métricas */
 void *run_worker_thread(void *arg) {
     ThreadArgs *t_args = (ThreadArgs *)arg;
     

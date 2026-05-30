@@ -41,27 +41,25 @@ int             produtores_ativos = 0;
 pthread_mutex_t metrics_mutex     = PTHREAD_MUTEX_INITIALIZER;
 
 /* =========================================================
- * Wrappers de semáforo — tratam interrupções por sinal (EINTR)
- *
- * sem_wait() pode ser interrompido por um sinal antes de decrementar
- * o semáforo; nesse caso devolve -1 com errno == EINTR e temos de
- * repetir a chamada para não perder a espera.
+ * Wrappers de semáforo com tratamento de interrupções EINTR
  * ========================================================= */
+
+/* Aguarda um semáforo com retry em caso de sinal */
 static void esperar(sem_t *s) {
     while (sem_wait(s) == -1 && errno == EINTR)
         ;   /* repetir se interrompido por sinal */
 }
 
+/* Assinala um semáforo (incrementa contador) */
 static void assinalar(sem_t *s) {
     sem_post(s);
 }
 
 /* =========================================================
  * init_bounded_buffer / destroy_bounded_buffer
+ * Inicializa e limpa o buffer circular com sincronização
  * ========================================================= */
-
-/* ALTERAÇÃO: produtores_ativos já não é inicializado aqui — o main
- * fá-lo depois de saber quantos produtores vai criar (ver main_prodcons.c). */
+/* Inicializa o buffer circular e seus semáforos */
 void init_bounded_buffer(void) {
     buffer.in    = 0;
     buffer.out   = 0;
@@ -73,6 +71,7 @@ void init_bounded_buffer(void) {
     sem_init(&buffer.full,  0, 0);
 }
 
+/* Liberta recursos do buffer circular */
 void destroy_bounded_buffer(void) {
     pthread_mutex_destroy(&buffer.mutex);
     sem_destroy(&buffer.empty);
@@ -89,6 +88,7 @@ void destroy_bounded_buffer(void) {
  *   4. unlock(mutex)
  *   5. assinalar(full) → avisa consumidores que há 1 slot ocupado
  * ========================================================= */
+/* Insere uma entry no buffer circular (chamado pelo produtor) */
 static void inserir_no_buffer(LogEntry entry) {
     esperar(&buffer.empty);
     pthread_mutex_lock(&buffer.mutex);
@@ -118,6 +118,7 @@ static void inserir_no_buffer(LogEntry entry) {
  *     (com mutex) e acorda todos os consumidores para que possam verificar
  *     se devem sair.
  * ========================================================= */
+/* Thread produtor: lê logs de ficheiros e insere no buffer */
 void *run_producer(void *arg) {
     ProducerArgs *a = (ProducerArgs *)arg;
 

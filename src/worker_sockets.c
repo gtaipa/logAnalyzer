@@ -17,6 +17,11 @@
 /* ─────────────────────────────────────────────────────────────────────────────
  * Funções para enviar mensagens ao pai
  * ───────────────────────────────────────────────────────────────────────────── */
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Funções para enviar mensagens ao pai via Unix Domain Socket
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+/* Envia atualização de progresso ao pai via socket */
 static void enviar_progresso(int sock, int worker_index, long bytes_done, long bytes_total) {
     int tipo = MSG_PROGRESSO;
     write(sock, &tipo, sizeof(tipo));
@@ -29,6 +34,7 @@ static void enviar_progresso(int sock, int worker_index, long bytes_done, long b
     write(sock, &pu, sizeof(pu));
 }
 
+/* Prepara resultado final para envio ao pai */
 static void preparar_resultado(const Metrics *m, WorkerResult *r) {
     memset(r, 0, sizeof(*r));
     r->pid            = getpid();
@@ -81,6 +87,7 @@ static void preparar_resultado(const Metrics *m, WorkerResult *r) {
     }
 }
 
+/* Envia resultado final ao pai via socket */
 static void enviar_resultado(int sock, Metrics *m) {
     int tipo = MSG_RESULTADO;
     write(sock, &tipo, sizeof(tipo));
@@ -103,6 +110,11 @@ static void enviar_resultado(int sock, Metrics *m) {
  *   • Fim no meio de uma linha → continua a ler até ao '\n' (para não partir
  *     uma linha entre dois workers).
  * ───────────────────────────────────────────────────────────────────────────── */
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Processamento de lógicas por fatia de bytes com tratamento de fronteiras
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+/* Processa intervalo de bytes com sincronização entre workers */
 static void processar_por_bytes(char **ficheiros, int total_ficheiros, Metrics *m,
                                 int sock, int worker_index,
                                 off_t byte_inicio, off_t byte_fim, int verbose) {

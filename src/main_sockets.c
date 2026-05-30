@@ -49,6 +49,7 @@
 
 #define LARGURA_BARRA 20
 
+/* Desenha dashboard com progresso de cada worker no terminal */
 static void desenhar_dashboard(ProgressUpdate *progressos, int num_workers) {
     /* Subir o cursor tantas linhas quantos workers existem */
     printf("\033[%dA", num_workers);
@@ -80,13 +81,13 @@ static void desenhar_dashboard(ProgressUpdate *progressos, int num_workers) {
  * UTILITÁRIOS DO PAI
  * ════════════════════════════════════════════════════════════════════════════= */
 
-/* Libertar o array de caminhos de ficheiros */
+/* Liberta memoria alocada para ficheiros */
 static void libertar_ficheiros(char **ficheiros, int total) {
     for (int i = 0; i < total; i++) free(ficheiros[i]);
     free(ficheiros);
 }
 
-/* Obter o total de bytes de todos os ficheiros via stat() — sem ler o conteúdo */
+/* Obtem tamanho total em bytes de todos os ficheiros */
 static off_t obter_bytes_totais(char **ficheiros, int total_ficheiros) {
     off_t total = 0;
     struct stat st;
@@ -97,7 +98,7 @@ static off_t obter_bytes_totais(char **ficheiros, int total_ficheiros) {
     return total;
 }
 
-/* Ler o directório e devolver um array com os caminhos dos .log e .json */
+/* Lê directory e retorna array de caminhos para ficheiros .log e .json */
 static char **ler_directorio(const char *dir, int *total_out) {
     int capacidade = 10;
     int total = 0;

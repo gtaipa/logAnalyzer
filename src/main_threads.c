@@ -12,15 +12,15 @@
 
 #define MAX_THREADS 64
 
-/* Variáveis Globais para o Dashboard Partilhado */
+/* Variáveis Globais para o Dashboard Partilhado entre threads */
 static long   g_lines_done[MAX_THREADS];
 static long   g_lines_total[MAX_THREADS];
 static int    g_num_workers  = 0;
 static time_t g_start_time   = 0;
-static volatile int g_all_done = 0; // Flag para parar a thread monitora
+static volatile int g_all_done = 0; /* Flag para parar a thread monitora */
 static int    g_dashboard_enabled = 0;
 
-/* Função que desenha a interface (idêntica aos sockets) */
+/* Desenha o dashboard em tempo real com progresso de cada thread */
 static void draw_dashboard(void) {
     int linhas = g_num_workers + 7;
     posix_writef(STDOUT_FILENO, "\033[%dA", linhas); // Move o cursor para cima
@@ -69,6 +69,7 @@ static void draw_dashboard(void) {
 }
 
 /* Thread Monitora: Fica em loop a desenhar o dashboard até os workers acabarem */
+/* Thread monitora: atualiza o dashboard enquanto os workers processam */
 void *run_monitor_thread(void *arg) {
     (void)arg;
     while (!g_all_done) {
@@ -79,6 +80,7 @@ void *run_monitor_thread(void *arg) {
     pthread_exit(NULL);
 }
 
+/* Gera relatorio final com estatisticas e salva em ficheiro se solicitado */
 void gerar_relatorio_threads(Metrics *total, char *modo, char *output_file) {
     int fd_out = STDOUT_FILENO;
     int fd_file = -1;
@@ -119,6 +121,7 @@ void gerar_relatorio_threads(Metrics *total, char *modo, char *output_file) {
     if (fd_file >= 0) close(fd_file);
 }
 
+/* Funcao principal: processa logs com N threads */
 int main(int argc, char *argv[]) {
     g_dashboard_enabled = isatty(STDOUT_FILENO);
 
