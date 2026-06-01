@@ -352,17 +352,22 @@ void gerar_relatorio_threads(Metrics *total, char *modo, char *output_file) {
  *  8. Imprimir o relatório e libertar memória.
  */
 int main(int argc, char *argv[]) {
-    /* Verificar se o stdout é um terminal (TTY) para ativar o dashboard ANSI */
+    /*
+     * isatty: verifica se o descritor STDOUT está ligado a um terminal real
+     * (TTY). Se a saída for redireccionada para um ficheiro ou pipe,
+     * isatty retorna 0 e o dashboard ANSI é desativado para não poluir
+     * o ficheiro com sequências de escape ininteligíveis.
+     */
     g_dashboard_enabled = isatty(STDOUT_FILENO);
 
-    /* Validação mínima de argumentos obrigatórios */
+    /* Validação mínima de argumentos obrigatórios — programa não arranca sem eles */
     if (argc < 4) {
         posix_writef(STDOUT_FILENO, "Uso: %s <diretorio> <num_threads> <modo> [--verbose] [--output=ficheiro.txt]\n", argv[0]);
         exit(1);
     }
 
     char *diretorio = argv[1];
-    int num_threads = atoi(argv[2]);
+    int num_threads = atoi(argv[2]); /* converter string "N" para inteiro */
     char *modo      = argv[3];
     int verbose     = 0;
     char *output_file = NULL;
@@ -370,16 +375,22 @@ int main(int argc, char *argv[]) {
     /* Processar flags opcionais: --verbose e --output=<caminho> */
     for (int i = 4; i < argc; i++) {
         if (strcmp(argv[i], "--verbose") == 0) verbose = 1;
+        /* strncmp com 9: compara apenas o prefixo "--output="; o resto é o caminho */
         else if (strncmp(argv[i], "--output=", 9) == 0) output_file = argv[i] + 9;
     }
 
-    /* Configurar o parser com o modo escolhido; abortar se inválido */
+    /* Configurar o parser com o modo escolhido; abortar com mensagem se inválido */
     if (parser_set_mode_from_string(modo) != 0) {
         posix_writef(STDERR_FILENO, "Modo invalido: %s (use security|performance|traffic|full)\n", modo);
         exit(1);
     }
 
     /* ── 1. Descobrir ficheiros ── */
+    /*
+     * Usar um array dinâmico (capacidade inicial = 10) que duplica quando
+     * necessário — padrão clássico de lista dinâmica em C.
+     * opendir / readdir são funções POSIX para iterar entradas de diretório.
+     */
     int capacidade = 10, total_ficheiros = 0;
     char **ficheiros = malloc(capacidade * sizeof(char *));
     DIR *dir = opendir(diretorio);
@@ -389,6 +400,7 @@ int main(int argc, char *argv[]) {
     struct dirent *entrada;
     while ((entrada = readdir(dir)) != NULL) {
         int len = strlen(entrada->d_name);
+        /* Filtrar por extensão: comparar os últimos 4 ou 5 caracteres do nome */
         if ((len > 4 && strcmp(entrada->d_name + len - 4, ".log")  == 0) ||
             (len > 5 && strcmp(entrada->d_name + len - 5, ".json") == 0)) {
             /* Crescer o array dinamicamente se necessário (duplicar capacidade) */
@@ -396,22 +408,28 @@ int main(int argc, char *argv[]) {
                 capacidade *= 2;
                 ficheiros = realloc(ficheiros, capacidade * sizeof(char *));
             }
+            /* Construir o caminho completo: "<diretorio>/<nome>" */
             char caminho[512];
             snprintf(caminho, sizeof(caminho), "%s/%s", diretorio, entrada->d_name);
-            ficheiros[total_ficheiros++] = strdup(caminho);  /* cópia própria do caminho */
+            /* strdup: aloca memória para uma cópia própria do caminho */
+            ficheiros[total_ficheiros++] = strdup(caminho);
         }
     }
-    closedir(dir);
+    closedir(dir); /* libertar o handle do diretório após a iteração */
 
     if (total_ficheiros == 0) {
         posix_writef(STDOUT_FILENO, "Nenhum ficheiro .log ou .json encontrado.\n");
         exit(0);
     }
 
-    /* Garantir que não excedemos o limite de threads */
+    /* Garantir que não excedemos o limite de threads definido em MAX_THREADS */
     if (num_threads > MAX_THREADS) num_threads = MAX_THREADS;
 
     /* ── 2. Calcular total de bytes e dividir em fatias iguais ── */
+    /*
+     * stat: obtém metadados do ficheiro (incluindo st_size — tamanho em bytes)
+     * sem abrir o ficheiro. Somar todos os tamanhos dá o espaço total a dividir.
+     */
     struct stat st;
     off_t total_bytes = 0;
     for (int i = 0; i < total_ficheiros; i++) {
@@ -419,79 +437,97 @@ int main(int argc, char *argv[]) {
             total_bytes += st.st_size;
     }
 
-    /* Não faz sentido ter mais threads do que ficheiros */
+    /* Não faz sentido ter mais threads do que ficheiros (algumas ficariam sem trabalho) */
     if (num_threads > total_ficheiros) num_threads = total_ficheiros;
 
     /*
      * Divisão do espaço de endereçamento de bytes em fatias consecutivas:
-     *   Thread 0  → [0,            bytes_por_thread)
-     *   Thread 1  → [bytes_por_thread, 2*bytes_por_thread)
+     *   Thread 0  → [0,                  bytes_por_thread)
+     *   Thread 1  → [bytes_por_thread,   2*bytes_por_thread)
      *   ...
-     *   Thread N-1→ [N-1)*bytes_por_thread, total_bytes)   ← última apanha o resto
+     *   Thread N-1→ [(N-1)*bytes_por_thread, total_bytes)  ← última absorve o resto
      *
-     * Este padrão garante que todos os bytes são processados sem sobreposição.
+     * Este padrão garante que todos os bytes são processados exatamente uma
+     * vez, sem sobreposição entre threads. A última thread recebe o resto da
+     * divisão inteira (pode ser ligeiramente maior que as outras).
      */
     off_t bytes_por_thread = total_bytes / num_threads;
 
     /* ── 3. Inicializar estruturas ── */
     Metrics global_metrics;
-    init_metrics(&global_metrics);
+    init_metrics(&global_metrics); /* zerar todos os contadores antes de qualquer thread escrever */
 
     /*
-     * Mutex para proteger global_metrics durante a fase de fusão.
-     * Sem mutex, duas threads a escrever simultaneamente em global_metrics
-     * causariam uma race condition: incrementos perdidos e dados corrompidos.
-     * pthread_mutex_init com NULL usa atributos por omissão (mutex normal).
+     * Criar o mutex que protege `global_metrics` durante a fase de fusão.
+     * pthread_mutex_init com NULL usa atributos por omissão (mutex normal,
+     * não recursivo). Sem mutex, N threads a incrementar os mesmos campos
+     * simultaneamente causariam race conditions: leituras e escritas
+     * intercaladas perderiam atualizações silenciosamente.
+     *
+     * Este mutex é partilhado por todas as threads worker (passado via
+     * ThreadArgs.mutex) — todas usam o mesmo objeto para exclusão mútua.
      */
     pthread_mutex_t metrics_mutex;
     pthread_mutex_init(&metrics_mutex, NULL);
 
+    /*
+     * Alocar dinamicamente os arrays de identificadores de thread e de
+     * argumentos, pois `num_threads` só é conhecido em tempo de execução.
+     */
     pthread_t  *threads = malloc(num_threads * sizeof(pthread_t));
     ThreadArgs *args    = malloc(num_threads * sizeof(ThreadArgs));
-    pthread_t   monitor_thread;
+    pthread_t   monitor_thread; /* identificador da thread monitor do dashboard */
 
     /* Inicializar variáveis globais de progresso antes de criar as threads */
     g_num_workers = num_threads;
-    g_start_time  = time(NULL);
-    memset(g_bytes_done,  0, sizeof(g_bytes_done));
-    memset(g_bytes_total, 0, sizeof(g_bytes_total));
-    g_all_done = 0;
+    g_start_time  = time(NULL);   /* registar instante de início para o cronómetro */
+    memset(g_bytes_done,  0, sizeof(g_bytes_done));   /* progresso inicial = 0 bytes */
+    memset(g_bytes_total, 0, sizeof(g_bytes_total));  /* será preenchido por cada worker */
+    g_all_done = 0; /* flag de término: 0 = workers ainda a correr */
 
     /*
-     * Criar a thread monitor antes das workers para que o dashboard apareça
-     * imediatamente. Imprime N+7 linhas em branco primeiro para reservar
-     * espaço no terminal que será reutilizado pelos redesenhos ANSI.
+     * Criar a thread monitor ANTES das workers para que o dashboard apareça
+     * imediatamente. Primeiro imprime N+7 linhas em branco para reservar a
+     * área do terminal que será reutilizada pelos redesenhos ANSI subsequentes.
      *
-     * pthread_create: cria uma nova thread de execução.
-     *   - arg1: identificador da thread (preenchido pela função)
-     *   - arg2: atributos (NULL = padrão)
-     *   - arg3: função de entrada da thread
-     *   - arg4: argumento passado à função de entrada
+     * pthread_create — assinatura:
+     *   int pthread_create(pthread_t *tid,              ← identificador (saída)
+     *                      const pthread_attr_t *attr,  ← atributos (NULL = padrão)
+     *                      void *(*start)(void *),      ← função de entrada
+     *                      void *arg);                  ← argumento à função
+     * Retorna 0 em caso de sucesso; qualquer valor positivo indica erro.
      */
     if (g_dashboard_enabled) {
+        /* Reservar espaço em branco no terminal para o dashboard */
         for (int i = 0; i < g_num_workers + 7; i++) posix_writef(STDOUT_FILENO, "\n");
+        /* Lançar a thread monitor; corre imediatamente em paralelo com o main() */
         pthread_create(&monitor_thread, NULL, run_monitor_thread, NULL);
     }
 
     /* ── 4. Lançar threads com fatias de bytes ── */
     for (int i = 0; i < num_threads; i++) {
         /* Preencher os argumentos específicos desta thread worker */
-        args[i].ficheiros       = ficheiros;         /* lista partilhada de caminhos (só leitura) */
+        args[i].ficheiros       = ficheiros;         /* lista partilhada de caminhos (só leitura após init) */
         args[i].total_ficheiros = total_ficheiros;
-        args[i].byte_inicio     = (off_t)i * bytes_por_thread;
-        /* A última thread vai até ao fim real para absorver o resto da divisão inteira */
+        args[i].byte_inicio     = (off_t)i * bytes_por_thread;        /* início da fatia (inclusivo) */
+        /*
+         * A última thread vai até ao fim real do espaço de bytes para absorver
+         * o resto da divisão inteira (total_bytes % num_threads bytes extra).
+         */
         args[i].byte_fim        = (i == num_threads - 1) ? total_bytes : (off_t)(i + 1) * bytes_por_thread;
-        args[i].worker_index    = i;
+        args[i].worker_index    = i;                 /* índice único para o dashboard e para g_bytes_done[] */
         args[i].verbose         = verbose;
-        args[i].global_metrics  = &global_metrics;   /* partilhado — acesso via mutex */
+        args[i].global_metrics  = &global_metrics;   /* estrutura partilhada — acedida via mutex na fusão */
         args[i].mutex           = &metrics_mutex;    /* mesmo mutex para todas as threads */
-        args[i].bytes_done      = &g_bytes_done[i];  /* cada thread escreve na sua posição */
-        args[i].bytes_total     = &g_bytes_total[i];
+        args[i].bytes_done      = &g_bytes_done[i];  /* cada thread escreve só na sua posição — sem conflito */
+        args[i].bytes_total     = &g_bytes_total[i]; /* quota desta thread, lida pelo dashboard */
 
         /*
-         * pthread_create: lança a thread i com a função run_worker_thread.
-         * Cada thread recebe um ponteiro para o seu próprio ThreadArgs.
-         * As threads correm em paralelo a partir deste ponto.
+         * pthread_create: lançar a thread i.
+         * A partir desta chamada, run_worker_thread corre concorrentemente
+         * com o main() e com as threads já criadas.
+         * Cada thread recebe &args[i] — ponteiros para posições distintas
+         * do array, sem partilha de estrutura ThreadArgs entre threads.
          */
         if (pthread_create(&threads[i], NULL, run_worker_thread, &args[i]) != 0) {
             perror("Erro ao criar thread");
@@ -501,34 +537,50 @@ int main(int argc, char *argv[]) {
 
     /* ── 5. Esperar pelas threads ── */
     /*
-     * pthread_join: bloqueia o main() até que a thread indicada termine.
-     * Garante que todas as métricas locais já foram fundidas nas globais
-     * antes de acedermos a global_metrics para o relatório.
-     * Sem pthread_join, o main() poderia ler global_metrics incompleta.
+     * pthread_join: bloqueia a thread chamante (main) até que a thread
+     * identificada por `threads[i]` termine (chamou pthread_exit ou retornou).
+     *
+     * Porque é necessário pthread_join aqui:
+     *  - Garante que todas as N workers terminaram e que as suas fusões de
+     *    métricas em global_metrics foram completamente executadas.
+     *  - Sem pthread_join, o main() poderia ler global_metrics ainda
+     *    incompleta (dados parciais de threads que ainda não terminaram).
+     *  - Também liberta os recursos internos (stack, TLS) da thread terminada.
+     *
+     * O segundo argumento (NULL) indica que não queremos o valor de retorno
+     * da thread (que seria o argumento de pthread_exit).
      */
     for (int i = 0; i < num_threads; i++)
         pthread_join(threads[i], NULL);
 
-    /* Sinalizar a thread monitor que pode terminar e aguardar a sua saída */
+    /*
+     * Após todos os pthread_join das workers, global_metrics está completa e
+     * consistente — não há mais threads a escrever nela.
+     * Sinalizar à thread monitor que pode fazer o redesenho final e terminar.
+     */
     if (g_dashboard_enabled) {
-        g_all_done = 1;                        /* escrever flag de fim */
-        pthread_join(monitor_thread, NULL);    /* esperar redesenho final */
+        g_all_done = 1;                        /* setar flag: workers terminaram */
+        pthread_join(monitor_thread, NULL);    /* aguardar o redesenho final do dashboard */
     }
 
-    /* Libertar o mutex — já não há threads a aceder às métricas globais */
+    /*
+     * pthread_mutex_destroy: libertar os recursos internos do mutex.
+     * Só é seguro chamar depois de garantir que nenhuma thread o usa.
+     * Aqui é seguro porque todos os pthread_join já retornaram.
+     */
     pthread_mutex_destroy(&metrics_mutex);
 
     /* ── 6. Relatório e limpeza ── */
-    long elapsed = (long)(time(NULL) - g_start_time);
+    long elapsed = (long)(time(NULL) - g_start_time); /* tempo total de processamento */
     gerar_relatorio_threads(&global_metrics, modo, output_file);
     posix_writef(STDOUT_FILENO, "Tempo de processamento: %ldmin %02lds\n",
                  elapsed / 60, elapsed % 60);
 
-    /* Libertar memória dinâmica alocada para caminhos e estruturas */
-    for (int i = 0; i < total_ficheiros; i++) free(ficheiros[i]);
-    free(ficheiros);
-    free(threads);
-    free(args);
+    /* Libertar toda a memória dinâmica alocada para caminhos e estruturas */
+    for (int i = 0; i < total_ficheiros; i++) free(ficheiros[i]); /* strings duplicadas com strdup */
+    free(ficheiros);  /* array de ponteiros */
+    free(threads);    /* array de identificadores de thread */
+    free(args);       /* array de argumentos das threads */
 
     return 0;
 }
