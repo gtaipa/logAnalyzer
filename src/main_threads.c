@@ -22,6 +22,28 @@
  *    `g_bytes_total`), que são atualizados atomicamente por cada worker. A thread
  *    monitor não precisa de mutex porque lê valores individuais de longa
  *    dimensão que, na prática, são atualizados de forma atómica em x86-64.
+ *
+ * Ciclo de vida das threads neste programa:
+ * @code
+ *   main()
+ *     │
+ *     ├─ pthread_create → monitor_thread  (1 thread)
+ *     │       │
+ *     │       └─ loop: draw_dashboard() + usleep(100ms) até g_all_done
+ *     │
+ *     ├─ pthread_create → worker_thread[0]  ─┐
+ *     ├─ pthread_create → worker_thread[1]   │ correm em paralelo
+ *     │  ...                                 │
+ *     └─ pthread_create → worker_thread[N-1]─┘
+ *             │
+ *             └─ cada uma: processa fatia → mutex_lock → funde → mutex_unlock
+ *                          → pthread_exit(NULL)
+ *
+ *   main() bloqueia em pthread_join(worker[0..N-1])
+ *   main() seta g_all_done = 1
+ *   main() bloqueia em pthread_join(monitor_thread)
+ *   main() → gerar_relatorio_threads() → exit
+ * @endcode
  */
 
 #include <stdio.h>
@@ -235,23 +257,42 @@ void gerar_relatorio_threads(Metrics *total, char *modo, char *output_file) {
     int fd_out = STDOUT_FILENO;  /* destino por omissão: stdout */
     int fd_file = -1;
 
-    /* Se foi pedido ficheiro de saída, tentar abri-lo/criá-lo */
+    /*
+     * Se foi especificado um ficheiro de saída, tentar criá-lo/truncá-lo.
+     * O_WRONLY: abrir apenas para escrita.
+     * O_CREAT:  criar se não existir.
+     * O_TRUNC:  truncar (apagar conteúdo) se já existir.
+     * 0644:     permissões — dono lê+escreve, grupo e outros só lêem.
+     */
     if (output_file != NULL) {
         fd_file = open(output_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd_file >= 0) {
             fd_out = fd_file;  /* redirecionar saída para o ficheiro */
             posix_writef(STDOUT_FILENO, "\n[INFO] A gravar relatorio no ficheiro: %s\n", output_file);
         }
+        /* Se open falhar (disco cheio, permissões, …), fd_out mantém-se STDOUT */
     }
 
+    /*
+     * Construir o relatório em memória (buffer estático de 4 KiB) antes de
+     * escrever. Esta abordagem evita múltiplas chamadas a write() e reduz a
+     * fragmentação da saída. snprintf com `buffer + len` vai preenchendo o
+     * buffer de forma segura, nunca escrevendo além dos limites.
+     */
     char buffer[4096];
     int len = 0;
 
-    /* Cabeçalho do relatório com o modo usado */
+    /* Cabeçalho do relatório com o modo de análise usado */
     len += snprintf(buffer + len, sizeof(buffer) - len, "\n=== RELATORIO FINAL THREADS (%s) ===\n", modo);
     len += snprintf(buffer + len, sizeof(buffer) - len, "Total de linhas : %ld\n", total->total_lines);
 
-    /* Secção de alertas de segurança — presente nos modos "security" e "full" */
+    /*
+     * Secção de alertas de segurança.
+     * Presente nos modos "security" e "full" — filtra contagens de severidade
+     * WARN, ERROR e CRITICAL encontradas nos logs.
+     * `total` já contém a fusão de todas as threads (protegida pelo mutex
+     * durante a fase de fusão em worker_threads.c).
+     */
     if (strcmp(modo, "security") == 0 || strcmp(modo, "full") == 0) {
         len += snprintf(buffer + len, sizeof(buffer) - len, "\n--- ALERTAS DE SEGURANCA ---\n");
         len += snprintf(buffer + len, sizeof(buffer) - len, "WARNINGS        : %ld\n", total->count_warn);
@@ -259,7 +300,11 @@ void gerar_relatorio_threads(Metrics *total, char *modo, char *output_file) {
         len += snprintf(buffer + len, sizeof(buffer) - len, "CRITICAL        : %ld\n", total->count_critical);
     }
 
-    /* Secção de tráfego HTTP — presente nos modos "traffic" e "full" */
+    /*
+     * Secção de estatísticas de tráfego HTTP.
+     * Presente nos modos "traffic" e "full" — apresenta mensagens INFO e
+     * erros de cliente/servidor (HTTP 4xx + 5xx somados).
+     */
     if (strcmp(modo, "traffic") == 0 || strcmp(modo, "full") == 0) {
         len += snprintf(buffer + len, sizeof(buffer) - len, "\n--- ESTATISTICAS DE TRAFEGO ---\n");
         len += snprintf(buffer + len, sizeof(buffer) - len, "INFO            : %ld\n", total->count_info);
@@ -268,8 +313,15 @@ void gerar_relatorio_threads(Metrics *total, char *modo, char *output_file) {
 
     len += snprintf(buffer + len, sizeof(buffer) - len, "=================================\n\n");
 
-    /* Escrever o relatório de uma só vez para o descritor de destino */
+    /*
+     * Escrever o relatório completo de uma só vez com write() POSIX.
+     * Uma única chamada a write() é preferível a várias printf() porque:
+     *  - é atómica para tamanhos inferiores a PIPE_BUF (4 KiB no Linux);
+     *  - evita intercalação com output de outras fontes (e.g., stderr).
+     */
     if (write(fd_out, buffer, len) < 0) perror("Erro ao escrever relatorio");
+
+    /* Fechar o descritor do ficheiro de saída se foi aberto nesta função */
     if (fd_file >= 0) close(fd_file);
 }
 
