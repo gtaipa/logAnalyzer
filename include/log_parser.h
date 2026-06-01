@@ -1,22 +1,26 @@
-#ifndef LOG_PARSER_H
-#define LOG_PARSER_H
-
-/* =========================================================
- * log_parser.h - Estruturas e prototipos do parser de logs
+/**
+ * @file log_parser.h
+ * @brief Estruturas normalizadas e protótipos dos parsers de baixo nível para
+ *        cada formato de log suportado pelo logAnalyzer.
  *
  * Este header define:
- * - Limites maximos de buffers usados no parsing
- * - Estruturas normalizadas para cada formato suportado
- * - Prototipos das funcoes de parsing e timestamps
+ * - Limites máximos de buffers usados no parsing.
+ * - Estruturas normalizadas para cada formato suportado:
+ *   ApacheLogEntry, JSONLogEntry, SyslogEntry, NginxErrorEntry.
+ * - Protótipos das funções de parsing por formato (parse_apache_log, etc.).
+ * - Protótipos das funções auxiliares de parsing de timestamps.
  *
- * Convencao de retorno (em geral):
- * - 0  : sucesso (linha reconhecida / parse efetuado)
- * - -1 : erro (linha invalida / parametros invalidos)
+ * Convenção de retorno (em geral):
+ * - 0  : sucesso (linha reconhecida / parse efetuado).
+ * - -1 : erro (linha inválida / parâmetros inválidos).
  *
- * Nota: alguns campos (ex.: timestamps) sao "best-effort" nas funcoes
+ * Nota: alguns campos (ex.: timestamps) são "best-effort" nas funções
  * parse_*_log(): mesmo que o parse do timestamp falhe, o parser pode
- * devolver 0 se o resto do formato bater (ver implementacao).
- * ========================================================= */
+ * devolver 0 se o resto do formato bater (ver implementação).
+ */
+
+#ifndef LOG_PARSER_H
+#define LOG_PARSER_H
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,13 +32,17 @@
 /* ---------------------------------------------------------
  * Limites de buffers
  * --------------------------------------------------------- */
-/* Tamanho maximo de uma linha lida do ficheiro de log. */
+
+/** @brief Tamanho máximo de uma linha lida do ficheiro de log (inclui terminador NUL). */
 #define MAX_LINE_LENGTH 4096
-/* Maximo para IPv6 textual (inclui terminador NUL). */
+
+/** @brief Tamanho máximo de um endereço IP em texto, suportando IPv6 (inclui terminador NUL). */
 #define MAX_IP_LENGTH 46
-/* URLs e campos "request" (inclui terminador NUL). */
+
+/** @brief Tamanho máximo de uma URL ou campo "request" (inclui terminador NUL). */
 #define MAX_URL_LENGTH 512
-/* Mensagens genericas (inclui terminador NUL). */
+
+/** @brief Tamanho máximo de uma mensagem genérica de log (inclui terminador NUL). */
 #define MAX_MSG_LENGTH 1024
 
 /* ---------------------------------------------------------
@@ -42,50 +50,53 @@
  * Exemplo:
  *  192.168.1.1 - - [13/Feb/2024:10:23:45 +0000] "GET / HTTP/1.1" 200 1234
  * --------------------------------------------------------- */
+
+/**
+ * @brief Entrada de log Apache Combined Log já parseada.
+ *
+ * Representa todos os campos extraídos de uma linha no formato Apache
+ * Combined Log. Campos que não constem na linha ficam com valor zero/vazio.
+ */
 typedef struct {
-    /* IP do cliente (IPv4/IPv6 como string). */
-    char ip[MAX_IP_LENGTH];
-    /* Timestamp (parte "13/Feb/2024:10:23:45"). Timezone pode ser ignorado. */
-    struct tm timestamp;
-    /* Metodo HTTP (GET/POST/...). */
-    char method[16];
-    /* URL/caminho pedido (sem query parsing). */
-    char url[MAX_URL_LENGTH];
-    /* Versao HTTP (ex.: "1.1"). */
-    char http_version[16];
-    /* Status code (ex.: 200, 404...). */
-    int status_code;
-    /* Tamanho da resposta em bytes (quando presente). */
-    long response_size;
-    /* Campos extra (podem nao ser preenchidos pelo parser atual). */
-    char referer[MAX_URL_LENGTH];
-    char user_agent[256];
+    char      ip[MAX_IP_LENGTH];       /**< @brief Endereço IP do cliente (IPv4 ou IPv6 como string). */
+    struct tm timestamp;               /**< @brief Timestamp da linha ("DD/Mon/YYYY:HH:MM:SS"); timezone ignorado. */
+    char      method[16];              /**< @brief Método HTTP da requisição (ex.: "GET", "POST"). */
+    char      url[MAX_URL_LENGTH];     /**< @brief URL/caminho pedido, sem query string parseada. */
+    char      http_version[16];        /**< @brief Versão do protocolo HTTP (ex.: "1.1", "2.0"). */
+    int       status_code;             /**< @brief Código de estado HTTP da resposta (ex.: 200, 404). */
+    long      response_size;           /**< @brief Tamanho da resposta em bytes; -1 ou 0 quando ausente. */
+    char      referer[MAX_URL_LENGTH]; /**< @brief Cabeçalho Referer da requisição (pode estar vazio). */
+    char      user_agent[256];         /**< @brief Cabeçalho User-Agent do cliente (pode estar vazio). */
 } ApacheLogEntry;
 
 /* ---------------------------------------------------------
  * JSON (Log estruturado simples)
- * Esperado algo do genero:
+ * Esperado algo do género:
  *  {"timestamp":"2024-02-13T10:23:45","level":"INFO","service":"api","message":"...","metadata":{"ip":"...","user_id":123}}
  * --------------------------------------------------------- */
+
+/**
+ * @brief Entrada de log JSON estruturado já parseada.
+ *
+ * Representa os campos extraídos de uma linha de log no formato JSON
+ * simplificado (objeto de nível único com campos fixos e bloco "metadata").
+ */
 typedef struct {
-    /* Timestamp ISO-8601 basico (YYYY-MM-DDTHH:MM:SS). */
-    struct tm timestamp;
-    /* Nivel de severidade (mapeado de strings como "INFO", "WARN", ...). */
+    struct tm timestamp;           /**< @brief Timestamp ISO-8601 básico ("YYYY-MM-DDTHH:MM:SS"). */
+    /**
+     * @brief Nível de severidade mapeado a partir da string "level" do JSON.
+     */
     enum {
-        LOG_DEBUG = 0,
-        LOG_INFO = 1,
-        LOG_WARN = 2,
-        LOG_ERROR = 3,
-        LOG_CRITICAL = 4
+        LOG_DEBUG    = 0, /**< @brief Nível de depuração; detalhe máximo de execução. */
+        LOG_INFO     = 1, /**< @brief Informação operacional normal. */
+        LOG_WARN     = 2, /**< @brief Aviso de situação potencialmente problemática. */
+        LOG_ERROR    = 3, /**< @brief Erro que impede uma operação específica. */
+        LOG_CRITICAL = 4  /**< @brief Erro crítico de alta severidade. */
     } level;
-    /* Nome do servico (ex.: "auth", "api", ...). */
-    char service[64];
-    /* Mensagem principal. */
-    char message[MAX_MSG_LENGTH];
-    /* IP dentro de "metadata.ip" (se existir). */
-    char ip[MAX_IP_LENGTH];
-    /* user_id dentro de "metadata.user_id" (se existir). */
-    int user_id;
+    char service[64];              /**< @brief Nome do serviço que gerou o evento (ex.: "auth", "api"). */
+    char message[MAX_MSG_LENGTH];  /**< @brief Mensagem principal do evento de log. */
+    char ip[MAX_IP_LENGTH];        /**< @brief Endereço IP extraído de "metadata.ip", quando presente. */
+    int  user_id;                  /**< @brief Identificador do utilizador de "metadata.user_id"; 0 quando ausente. */
 } JSONLogEntry;
 
 /* ---------------------------------------------------------
@@ -93,23 +104,24 @@ typedef struct {
  * Exemplo:
  *  <34>Feb 13 10:23:45 hostname sshd[1234]: Failed password for invalid user ...
  * --------------------------------------------------------- */
+
+/**
+ * @brief Entrada de log Syslog (RFC 3164) já parseada.
+ *
+ * Representa os campos extraídos de uma linha no formato syslog tradicional,
+ * incluindo prioridade, timestamp, hostname, serviço, PID e mensagem.
+ * Inclui também flags de deteção heurística para categorias de segurança comuns.
+ */
 typedef struct {
-    /* Prioridade (campo "<nnn>"), ou 0 quando ausente. */
-    int priority;
-    /* Timestamp "Mon DD HH:MM:SS" (ano inferido do tempo atual). */
-    struct tm timestamp;
-    /* Hostname logo apos o timestamp. */
-    char hostname[256];
-    /* Nome do servico (ex.: "sshd", "sudo", ...). */
-    char service[64];
-    /* PID quando presente em "service[pid]". */
-    int pid;
-    /* Mensagem restante apos ':'. */
-    char message[MAX_MSG_LENGTH];
-    /* Flags de deteccao simples (heuristicas por substring). */
-    bool is_auth_failure;
-    bool is_sudo_attempt;
-    bool is_firewall_block;
+    int       priority;            /**< @brief Campo de prioridade numérica "<nnn>"; 0 quando ausente. */
+    struct tm timestamp;           /**< @brief Timestamp no formato "Mon DD HH:MM:SS" (ano inferido do tempo atual). */
+    char      hostname[256];       /**< @brief Hostname do sistema que gerou a mensagem. */
+    char      service[64];         /**< @brief Nome do serviço ou processo (ex.: "sshd", "sudo", "kernel"). */
+    int       pid;                 /**< @brief PID do processo, quando presente em "serviço[pid]"; 0 caso contrário. */
+    char      message[MAX_MSG_LENGTH]; /**< @brief Texto da mensagem após o separador ':'. */
+    bool      is_auth_failure;     /**< @brief true se a heurística detetou uma falha de autenticação na mensagem. */
+    bool      is_sudo_attempt;     /**< @brief true se a heurística detetou uma tentativa de elevação via sudo. */
+    bool      is_firewall_block;   /**< @brief true se a heurística detetou um bloqueio de firewall na mensagem. */
 } SyslogEntry;
 
 /* ---------------------------------------------------------
@@ -117,83 +129,134 @@ typedef struct {
  * Exemplo:
  *  2024/02/13 10:23:45 [error] 12345#0: *1234 connect() failed ..., client: 1.2.3.4, server: ..., request: "GET / ..."
  * --------------------------------------------------------- */
+
+/**
+ * @brief Entrada de log Nginx Error Log já parseada.
+ *
+ * Representa os campos extraídos de uma linha no formato de log de erros
+ * do Nginx, incluindo timestamp, nível, PID, TID, ID de conexão, mensagem
+ * e campos adicionais quando presentes.
+ */
 typedef struct {
-    /* Timestamp "YYYY/MM/DD HH:MM:SS" (quando parseavel). */
-    struct tm timestamp;
-    /* Nivel dentro de "[...]" (mapeado para enum). */
+    struct tm timestamp;           /**< @brief Timestamp no formato "YYYY/MM/DD HH:MM:SS", quando parseável. */
+    /**
+     * @brief Nível de severidade mapeado a partir da string entre colchetes "[...]".
+     */
     enum {
-        NGINX_DEBUG = 0,
-        NGINX_INFO = 1,
-        NGINX_NOTICE = 2,
-        NGINX_WARN = 3,
-        NGINX_ERROR = 4,
-        NGINX_CRIT = 5,
-        NGINX_ALERT = 6,
-        NGINX_EMERG = 7
+        NGINX_DEBUG  = 0, /**< @brief Nível de depuração detalhado do Nginx. */
+        NGINX_INFO   = 1, /**< @brief Informação operacional do Nginx. */
+        NGINX_NOTICE = 2, /**< @brief Aviso de notificação (menos grave que WARN). */
+        NGINX_WARN   = 3, /**< @brief Aviso de situação potencialmente problemática. */
+        NGINX_ERROR  = 4, /**< @brief Erro que impede o processamento de um pedido. */
+        NGINX_CRIT   = 5, /**< @brief Erro crítico que pode comprometer o serviço. */
+        NGINX_ALERT  = 6, /**< @brief Alerta que exige ação imediata. */
+        NGINX_EMERG  = 7  /**< @brief Emergência; o sistema pode estar inutilizável. */
     } level;
-    /* PID e TID extraidos de "pid#tid" (quando presente). */
-    int pid;
-    int tid;
-    /* ID de conexao extraido de "*<id>" (quando presente). */
-    long connection_id;
-    /* Mensagem (texto apos ':', ate ", client:" quando existir). */
-    char message[MAX_MSG_LENGTH];
-    /* IP do cliente quando existir em "client: <ip>". */
-    char client_ip[MAX_IP_LENGTH];
-    /* Campos extra (podem nao ser preenchidos pelo parser atual). */
-    char server[256];
-    char request[MAX_URL_LENGTH];
+    int       pid;                 /**< @brief PID do processo worker do Nginx (extraído de "pid#tid"). */
+    int       tid;                 /**< @brief TID do thread worker do Nginx (extraído de "pid#tid"). */
+    long      connection_id;       /**< @brief Identificador de conexão extraído de "*<id>"; 0 quando ausente. */
+    char      message[MAX_MSG_LENGTH]; /**< @brief Texto da mensagem de erro até ", client:" quando existir. */
+    char      client_ip[MAX_IP_LENGTH]; /**< @brief Endereço IP do cliente em "client: <ip>"; vazio quando ausente. */
+    char      server[256];         /**< @brief Nome do servidor virtual em "server: <name>"; vazio quando ausente. */
+    char      request[MAX_URL_LENGTH]; /**< @brief Linha de pedido HTTP em "request: \"...\""; vazia quando ausente. */
 } NginxErrorEntry;
 
 /* ---------------------------------------------------------
- * Funcoes de parsing por formato
+ * Funções de parsing por formato
  * --------------------------------------------------------- */
+
 /**
- * Parse de uma linha Apache Combined Log.
- * @param line  Linha de log (string NUL-terminated).
- * @param entry Estrutura de saida (sera zerada antes de preencher).
- * @return 0 em sucesso, -1 em erro de formato/parametros.
+ * @brief Parseia uma linha no formato Apache Combined Log.
+ *
+ * Interpreta @p line segundo o formato Apache Combined Log e preenche
+ * a estrutura apontada por @p entry com os campos extraídos.
+ * A estrutura é zerada antes de ser preenchida.
+ *
+ * @param line  Linha de log (string terminada em NUL).
+ * @param entry Ponteiro para a estrutura ApacheLogEntry a preencher.
+ * @return 0 em caso de sucesso; -1 se o formato for inválido ou os parâmetros forem NULL.
  */
 int parse_apache_log(const char* line, ApacheLogEntry* entry);
 
 /**
- * Parse de uma linha JSON (formato simplificado).
- * @return 0 em sucesso, -1 em erro de formato/parametros.
+ * @brief Parseia uma linha no formato JSON simplificado.
+ *
+ * Interpreta @p line como um objeto JSON com os campos fixos esperados
+ * e preenche a estrutura apontada por @p entry.
+ * A estrutura é zerada antes de ser preenchida.
+ *
+ * @param line  Linha de log JSON (string terminada em NUL).
+ * @param entry Ponteiro para a estrutura JSONLogEntry a preencher.
+ * @return 0 em caso de sucesso; -1 se o formato for inválido ou os parâmetros forem NULL.
  */
 int parse_json_log(const char* line, JSONLogEntry* entry);
 
 /**
- * Parse de uma linha Syslog (RFC3164-ish).
- * @return 0 em sucesso, -1 em erro de formato/parametros.
+ * @brief Parseia uma linha no formato Syslog (RFC 3164).
+ *
+ * Interpreta @p line segundo o formato syslog tradicional e preenche
+ * a estrutura apontada por @p entry, incluindo a deteção heurística
+ * de falhas de autenticação, tentativas sudo e bloqueios de firewall.
+ * A estrutura é zerada antes de ser preenchida.
+ *
+ * @param line  Linha de log syslog (string terminada em NUL).
+ * @param entry Ponteiro para a estrutura SyslogEntry a preencher.
+ * @return 0 em caso de sucesso; -1 se o formato for inválido ou os parâmetros forem NULL.
  */
 int parse_syslog(const char* line, SyslogEntry* entry);
 
 /**
- * Parse de uma linha do Nginx Error Log.
- * @return 0 em sucesso, -1 em erro de formato/parametros.
+ * @brief Parseia uma linha no formato Nginx Error Log.
+ *
+ * Interpreta @p line segundo o formato de log de erros do Nginx e
+ * preenche a estrutura apontada por @p entry com todos os campos
+ * reconhecíveis.
+ * A estrutura é zerada antes de ser preenchida.
+ *
+ * @param line  Linha de log Nginx (string terminada em NUL).
+ * @param entry Ponteiro para a estrutura NginxErrorEntry a preencher.
+ * @return 0 em caso de sucesso; -1 se o formato for inválido ou os parâmetros forem NULL.
  */
 int parse_nginx_error(const char* line, NginxErrorEntry* entry);
 
 /* ---------------------------------------------------------
- * Funcoes auxiliares de parsing de timestamps
+ * Funções auxiliares de parsing de timestamps
  * --------------------------------------------------------- */
+
 /**
- * Converte timestamp Apache: "13/Feb/2024:10:23:45 +0000" (timezone ignorado).
- * Preenche tm_out quando possivel.
- * @return 0 em sucesso, -1 se o formato for invalido.
+ * @brief Converte um timestamp Apache para struct tm.
+ *
+ * Interpreta @p timestamp_str no formato "DD/Mon/YYYY:HH:MM:SS +ZZZZ"
+ * (timezone ignorado) e preenche @p tm_out.
+ *
+ * @param timestamp_str String com o timestamp Apache (terminada em NUL).
+ * @param tm_out        Ponteiro para a struct tm a preencher.
+ * @return 0 em caso de sucesso; -1 se o formato for inválido.
  */
 int parse_apache_timestamp(const char* timestamp_str, struct tm* tm_out);
 
 /**
- * Converte timestamp ISO-8601 basico: "YYYY-MM-DDTHH:MM:SS".
- * @return 0 em sucesso, -1 se o formato for invalido.
+ * @brief Converte um timestamp ISO-8601 básico para struct tm.
+ *
+ * Interpreta @p timestamp_str no formato "YYYY-MM-DDTHH:MM:SS"
+ * e preenche @p tm_out.
+ *
+ * @param timestamp_str String com o timestamp ISO-8601 (terminada em NUL).
+ * @param tm_out        Ponteiro para a struct tm a preencher.
+ * @return 0 em caso de sucesso; -1 se o formato for inválido.
  */
 int parse_iso8601_timestamp(const char* timestamp_str, struct tm* tm_out);
 
 /**
- * Converte timestamp syslog: "Feb 13 10:23:45".
- * O ano e obtido a partir do tempo atual (localtime_r).
- * @return 0 em sucesso, -1 se o formato for invalido.
+ * @brief Converte um timestamp syslog para struct tm.
+ *
+ * Interpreta @p timestamp_str no formato "Mon DD HH:MM:SS" e preenche
+ * @p tm_out. O ano é obtido a partir do tempo atual via localtime_r(),
+ * uma vez que o formato syslog RFC 3164 não inclui o ano.
+ *
+ * @param timestamp_str String com o timestamp syslog (terminada em NUL).
+ * @param tm_out        Ponteiro para a struct tm a preencher.
+ * @return 0 em caso de sucesso; -1 se o formato for inválido.
  */
 int parse_syslog_timestamp(const char* timestamp_str, struct tm* tm_out);
 

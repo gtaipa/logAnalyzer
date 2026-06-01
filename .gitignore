@@ -1,3 +1,6 @@
 logAnalyzer
-logAnalyzer
+logAnalyzer_sockets
+logAnalyzer_pipes
+logAnalyzer_threads
+logAnalyzer_prodcons
 results_*.txt
