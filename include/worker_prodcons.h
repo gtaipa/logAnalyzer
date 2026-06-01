@@ -3,12 +3,12 @@
 
 #include <pthread.h>
 #include <semaphore.h>
+#include <sys/types.h>
 #include "parser.h"
 
-#define BUFFER_SIZE      10
+#define BUFFER_SIZE      30
 #define ALERT_BUFFER_SIZE 64
 
-/* ---- Buffer circular ---- */
 typedef struct {
     LogEntry        queue[BUFFER_SIZE];
     int             count;
@@ -19,37 +19,30 @@ typedef struct {
     sem_t           full;
 } LogQueue;
 
-/* ---- Argumentos do produtor ---- */
 typedef struct {
-    char **ficheiros;
-    int    inicio;
-    int    fim;
-    int    worker_index;
-    int    verbose;
-    long  *lines_done;   /* para o dashboard */
-    long  *lines_total;  /* para o dashboard */
+    char  **ficheiros;
+    int     total_ficheiros;
+    off_t   byte_inicio;
+    off_t   byte_fim;
+    int     worker_index;
+    int     verbose;
+    long   *bytes_done;
+    long   *bytes_total;
 } ProducerArgs;
 
-/* ---- Argumentos do consumidor ---- */
 typedef struct {
     Metrics         *global_metrics;
     pthread_mutex_t *metrics_mutex;
     int              worker_index;
 } ConsumerArgs;
 
-/* ---- Variáveis globais (definidas em worker_prodcons.c) ---- */
 extern LogQueue        buffer;
 extern int             produtores_ativos;
 extern pthread_mutex_t metrics_mutex;
 
-/* ---- Funções ---- */
-/* Inicializa o buffer circular com mutex e semáforos */
 void  init_bounded_buffer(void);
-/* Destrói o buffer circular e liberta recursos */
 void  destroy_bounded_buffer(void);
-/* Função de thread produtor para ler logs e inserir no buffer */
 void *run_producer(void *arg);
-/* Função de thread consumidor para processar logs do buffer */
 void *run_consumer(void *arg);
 
 #endif /* WORKER_PRODCONS_H */

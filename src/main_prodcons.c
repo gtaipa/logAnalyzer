@@ -1,25 +1,3 @@
-/* main_prodcons.c
- *
- * ALTERAÇÃO: Este ficheiro foi reescrito quase na totalidade.
- * O original tinha as seguintes falhas críticas:
- *   1. main() não criava nenhuma thread — inicializava mutex/semáforos e terminava.
- *   2. main() não tinha return, causando comportamento indefinido.
- *   3. producer() e consumer_routine() estavam definidos DEPOIS do main()
- *      sem protótipos, o que é inválido em C99/C11.
- *   4. O produtor lia em blocos com read() em vez de linha a linha,
- *      corrompendo os dados no buffer.
- *   5. O consumidor escrevia para "results.txt" hardcoded em vez de
- *      acumular métricas como o resto do projecto.
- *   6. A pílula venenosa só funcionava com 1 consumidor.
- *
- * Este main segue a mesma estrutura de main_threads.c:
- *   - CLI idêntica aos outros executáveis do projecto.
- *   - Descoberta de ficheiros com opendir/readdir.
- *   - Divisão de ficheiros entre produtores (igual à divisão de threads).
- *   - Lançamento de N produtores + M consumidores.
- *   - Join em todos, depois relatório final.
- */
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,32 +6,25 @@
 #include <time.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 
 #include "parser.h"
 #include "posix_io.h"
 #include "worker_prodcons.h"
 
-/* Dashboard com atualizacoes de progresso */
 #define MAX_WORKERS 64
-static long   g_lines_done[MAX_WORKERS];
-static long   g_lines_total[MAX_WORKERS];
+static long   g_bytes_done[MAX_WORKERS];
+static long   g_bytes_total[MAX_WORKERS];
 static int    g_num_workers  = 0;
 static time_t g_start_time   = 0;
 static volatile int g_all_done = 0;
 
-/* Numero de consumidores fixo em 2 para demonstrar multiplos consumidores */
-#define NUM_CONSUMERS 2
+#define NUM_CONSUMERS 5
 
-/* =========================================================
- * imprimir_relatorio - Gera relatorio com estatisticas de analise
- * ========================================================= */
-/* Imprime relatorio final com metricas coletadas */
 static void imprimir_relatorio(Metrics *m, char *modo) {
-
     posix_writef(STDOUT_FILENO, "\n=== RELATORIO FINAL PRODCONS (%s) ===\n", modo);
     posix_writef(STDOUT_FILENO, "Total de linhas  : %ld\n", m->total_lines);
 
-    /* ---- Contadores por nível (Segurança) ---- */
     if (strcmp(modo, "security") == 0 || strcmp(modo, "full") == 0) {
         posix_writef(STDOUT_FILENO, "\n--- EVENTOS DE SEGURANCA ---\n");
         posix_writef(STDOUT_FILENO, "DEBUG            : %ld\n", m->count_debug);
@@ -63,31 +34,26 @@ static void imprimir_relatorio(Metrics *m, char *modo) {
         posix_writef(STDOUT_FILENO, "CRITICAL         : %ld\n", m->count_critical);
     }
 
-    /* ---- Performance (HTTP Status Codes) ---- */
     if (strcmp(modo, "performance") == 0 || strcmp(modo, "full") == 0) {
         posix_writef(STDOUT_FILENO, "\n--- PERFORMANCE ---\n");
         posix_writef(STDOUT_FILENO, "HTTP 4xx         : %ld\n", m->count_4xx);
         posix_writef(STDOUT_FILENO, "HTTP 5xx         : %ld\n", m->count_5xx);
     }
 
-    /* ---- Tráfego (HTTP Status Codes) ---- */
     if (strcmp(modo, "traffic") == 0 || strcmp(modo, "full") == 0) {
         posix_writef(STDOUT_FILENO, "\n--- TRAFEGO ---\n");
         posix_writef(STDOUT_FILENO, "HTTP 4xx         : %ld\n", m->count_4xx);
         posix_writef(STDOUT_FILENO, "HTTP 5xx         : %ld\n", m->count_5xx);
     }
 
-    /* ---- Top 10 IPs (ordenar por contagem) ---- */
     posix_writef(STDOUT_FILENO, "\n--- TOP 10 IPs ---\n");
 
-    /* Ordenar por bubble sort (igual ao main_sockets.c) */
     for (int i = 0; i < m->ip_num - 1; i++) {
         for (int j = 0; j < m->ip_num - i - 1; j++) {
             if (m->ip_count[j] < m->ip_count[j + 1]) {
                 long tmp_c = m->ip_count[j];
                 m->ip_count[j] = m->ip_count[j + 1];
                 m->ip_count[j + 1] = tmp_c;
-
                 char tmp_ip[IP_LEN];
                 strncpy(tmp_ip, m->ip_list[j], IP_LEN);
                 strncpy(m->ip_list[j], m->ip_list[j + 1], IP_LEN);
@@ -100,38 +66,32 @@ static void imprimir_relatorio(Metrics *m, char *modo) {
     if (limite == 0) {
         posix_writef(STDOUT_FILENO, "Nenhum IP encontrado.\n");
     } else {
-        for (int i = 0; i < limite; i++) {
+        for (int i = 0; i < limite; i++)
             posix_writef(STDOUT_FILENO, "%2d. %-16s (%ld pedidos)\n",
                          i + 1, m->ip_list[i], m->ip_count[i]);
-        }
     }
 
-    /* ---- Alertas críticos ---- */
     posix_writef(STDOUT_FILENO, "\n--- ALERTAS CRITICOS ---\n");
     if (m->num_alerts == 0) {
         posix_writef(STDOUT_FILENO, "Sem alertas criticos.\n");
     } else {
-        for (int i = 0; i < m->num_alerts; i++) {
+        for (int i = 0; i < m->num_alerts; i++)
             posix_writef(STDOUT_FILENO, "%2d. %s\n", i + 1, m->alerts[i]);
-        }
     }
 
     posix_writef(STDOUT_FILENO, "=================================\n");
 }
 
-/* =========================================================
- * draw_dashboard / run_monitor_thread
- * ========================================================= */
 static void draw_dashboard(void) {
-    int linhas = g_num_workers + 8;  /* +1 por causa da linha Elapsed */
+    int linhas = g_num_workers + 8;
     posix_writef(STDOUT_FILENO, "\033[%dA", linhas);
     posix_writef(STDOUT_FILENO, "\033[J");
 
     long total_done  = 0;
     long total_total = 0;
     for (int i = 0; i < g_num_workers; i++) {
-        total_done  += g_lines_done[i];
-        total_total += g_lines_total[i];
+        total_done  += g_bytes_done[i];
+        total_total += g_bytes_total[i];
     }
     int total_pct = (total_total > 0) ? (int)(total_done * 100 / total_total) : 0;
     if (total_pct > 100) total_pct = 100;
@@ -141,8 +101,8 @@ static void draw_dashboard(void) {
     posix_writef(STDOUT_FILENO, "╠══════════════════════════════════════════╣\n");
 
     for (int i = 0; i < g_num_workers; i++) {
-        int pct = (g_lines_total[i] > 0)
-                  ? (int)(g_lines_done[i] * 100 / g_lines_total[i]) : 0;
+        int pct = (g_bytes_total[i] > 0)
+                  ? (int)(g_bytes_done[i] * 100 / g_bytes_total[i]) : 0;
         if (pct > 100) pct = 100;
 
         char bar[21];
@@ -183,13 +143,7 @@ void *run_monitor_thread(void *arg) {
     pthread_exit(NULL);
 }
 
-/* =========================================================
- * main
- * ========================================================= */
 int main(int argc, char *argv[]) {
-
-    /* ALTERAÇÃO: CLI igual aos outros executáveis.
-     * O original não recebia argumentos nenhuns. */
     if (argc < 4) {
         posix_writef(STDOUT_FILENO,
                      "Uso: %s <diretorio> <num_produtores> <modo> [--verbose]\n",
@@ -197,22 +151,21 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
-    char *diretorio    = argv[1];
-    int   num_prod     = atoi(argv[2]);
-    char *modo         = argv[3];
-    int   verbose      = 0;
+    char *diretorio = argv[1];
+    int   num_prod  = atoi(argv[2]);
+    char *modo      = argv[3];
+    int   verbose   = 0;
 
     for (int i = 4; i < argc; i++)
         if (strcmp(argv[i], "--verbose") == 0) verbose = 1;
 
-    /* Configurar modo do parser (security / traffic / performance / full) */
     if (parser_set_mode_from_string(modo) != 0) {
         posix_writef(STDERR_FILENO,
                      "Modo invalido: %s (use security|performance|traffic|full)\n", modo);
         exit(1);
     }
 
-    /* ── 1. Descobrir ficheiros .log e .json no directório ── */
+    /* ── 1. Descobrir ficheiros ── */
     int   capacidade = 10, total_ficheiros = 0;
     char **ficheiros = malloc(capacidade * sizeof(char *));
     if (!ficheiros) { perror("malloc"); exit(1); }
@@ -244,55 +197,56 @@ int main(int argc, char *argv[]) {
         exit(0);
     }
 
-    /* Não faz sentido ter mais produtores do que ficheiros */
-    if (num_prod > total_ficheiros) num_prod = total_ficheiros;
+    if (num_prod > MAX_WORKERS) num_prod = MAX_WORKERS;
+
+    /* ── 2. Calcular total de bytes e dividir em fatias iguais ── */
+    struct stat st;
+    off_t total_bytes = 0;
+    for (int i = 0; i < total_ficheiros; i++) {
+        if (stat(ficheiros[i], &st) == 0)
+            total_bytes += st.st_size;
+    }
+
+    off_t bytes_por_prod = total_bytes / num_prod;
 
     posix_writef(STDOUT_FILENO,
                  "Ficheiros: %d | Produtores: %d | Consumidores: %d | Modo: %s\n\n",
                  total_ficheiros, num_prod, NUM_CONSUMERS, modo);
 
-    /* ── 2. Inicializar o buffer circular e as métricas globais ── */
-
-    /* ALTERAÇÃO: init_bounded_buffer() inicializa mutex e semáforos.
-     * produtores_ativos é inicializado AQUI, depois de sabermos num_prod,
-     * em vez de dentro de init_bounded_buffer(). */
+    /* ── 3. Inicializar buffer e métricas ── */
     init_bounded_buffer();
-    produtores_ativos = num_prod;   /* consumidores usam este valor para saber quando parar */
+    produtores_ativos = num_prod;
 
     Metrics global_metrics;
     init_metrics(&global_metrics);
 
-    /* ---- Dashboard ---- */
     g_num_workers = num_prod;
     g_start_time  = time(NULL);
     g_all_done    = 0;
-    memset(g_lines_done, 0, sizeof(g_lines_done));
-    memset(g_lines_total, 0, sizeof(g_lines_total));
+    memset(g_bytes_done,  0, sizeof(g_bytes_done));
+    memset(g_bytes_total, 0, sizeof(g_bytes_total));
 
-    for (int i = 0; i < g_num_workers + 8; i++)  /* +1 por causa da linha Elapsed */
+    for (int i = 0; i < g_num_workers + 8; i++)
         posix_writef(STDOUT_FILENO, "\n");
 
     pthread_t monitor_thread;
     pthread_create(&monitor_thread, NULL, run_monitor_thread, NULL);
 
-    /* ── 3. Preparar argumentos e lançar threads produtoras ── */
-
+    /* ── 4. Lançar produtores com fatias de bytes ── */
     pthread_t    *prod_threads = malloc(num_prod * sizeof(pthread_t));
     ProducerArgs *prod_args    = malloc(num_prod * sizeof(ProducerArgs));
     if (!prod_threads || !prod_args) { perror("malloc"); exit(1); }
 
-    /* Dividir ficheiros igualmente entre produtores (igual à divisão de threads) */
-    int fich_por_prod = total_ficheiros / num_prod;
-
     for (int i = 0; i < num_prod; i++) {
-        prod_args[i].ficheiros    = ficheiros;
-        prod_args[i].inicio       = i * fich_por_prod;
-        prod_args[i].fim          = (i == num_prod - 1) ? total_ficheiros
-                                                        : prod_args[i].inicio + fich_por_prod;
-        prod_args[i].worker_index = i;
-        prod_args[i].verbose      = verbose;
-        prod_args[i].lines_done   = &g_lines_done[i];
-        prod_args[i].lines_total  = &g_lines_total[i];
+        prod_args[i].ficheiros       = ficheiros;
+        prod_args[i].total_ficheiros = total_ficheiros;
+        prod_args[i].byte_inicio     = (off_t)i * bytes_por_prod;
+        prod_args[i].byte_fim        = (i == num_prod - 1) ? total_bytes
+                                                            : (off_t)(i + 1) * bytes_por_prod;
+        prod_args[i].worker_index    = i;
+        prod_args[i].verbose         = verbose;
+        prod_args[i].bytes_done      = &g_bytes_done[i];
+        prod_args[i].bytes_total     = &g_bytes_total[i];
 
         if (pthread_create(&prod_threads[i], NULL, run_producer, &prod_args[i]) != 0) {
             perror("pthread_create produtor");
@@ -300,8 +254,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    /* ── 4. Preparar argumentos e lançar threads consumidoras ── */
-
+    /* ── 5. Lançar consumidores ── */
     pthread_t    *cons_threads = malloc(NUM_CONSUMERS * sizeof(pthread_t));
     ConsumerArgs *cons_args    = malloc(NUM_CONSUMERS * sizeof(ConsumerArgs));
     if (!cons_threads || !cons_args) { perror("malloc"); exit(1); }
@@ -317,31 +270,24 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    /* ── 5. Esperar que todos os produtores terminem ──
-     * Os produtores terminam quando esgotam os seus ficheiros.
-     * Ao terminar, cada um decrementa produtores_ativos e acorda os consumidores. */
+    /* ── 6. Esperar produtores, parar dashboard, esperar consumidores ── */
     for (int i = 0; i < num_prod; i++)
         pthread_join(prod_threads[i], NULL);
 
     g_all_done = 1;
     pthread_join(monitor_thread, NULL);
 
-    /* ── 6. Esperar que todos os consumidores terminem ──
-     * Os consumidores saem quando produtores_ativos == 0 e buffer.count == 0.
-     * O último produtor acorda-os (ver run_producer em worker_prodcons.c). */
     for (int i = 0; i < NUM_CONSUMERS; i++)
         pthread_join(cons_threads[i], NULL);
 
-    /* ── 7. Destruir buffer e imprimir relatório ── */
+    /* ── 7. Relatório final ── */
     destroy_bounded_buffer();
 
     long elapsed = (long)(time(NULL) - g_start_time);
-
     imprimir_relatorio(&global_metrics, modo);
     posix_writef(STDOUT_FILENO, "Tempo de processamento: %ldmin %02lds\n",
                  elapsed / 60, elapsed % 60);
 
-    /* ── 8. Limpeza de memória ── */
     for (int i = 0; i < total_ficheiros; i++) free(ficheiros[i]);
     free(ficheiros);
     free(prod_threads);

@@ -6,25 +6,24 @@
 #include <unistd.h>
 #include <time.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 
 #include "posix_io.h"
 #include "worker_threads.h"
 
 #define MAX_THREADS 64
 
-/* Variáveis Globais para o Dashboard Partilhado entre threads */
-static long   g_lines_done[MAX_THREADS];
-static long   g_lines_total[MAX_THREADS];
+static long   g_bytes_done[MAX_THREADS];
+static long   g_bytes_total[MAX_THREADS];
 static int    g_num_workers  = 0;
 static time_t g_start_time   = 0;
-static volatile int g_all_done = 0; /* Flag para parar a thread monitora */
+static volatile int g_all_done = 0;
 static int    g_dashboard_enabled = 0;
 
-/* Desenha o dashboard em tempo real com progresso de cada thread */
 static void draw_dashboard(void) {
     int linhas = g_num_workers + 7;
-    posix_writef(STDOUT_FILENO, "\033[%dA", linhas); // Move o cursor para cima
-    posix_writef(STDOUT_FILENO, "\033[J");           // Limpa o ecrã abaixo do cursor
+    posix_writef(STDOUT_FILENO, "\033[%dA", linhas);
+    posix_writef(STDOUT_FILENO, "\033[J");
 
     time_t elapsed = time(NULL) - g_start_time;
     int hh = elapsed / 3600;
@@ -34,8 +33,8 @@ static void draw_dashboard(void) {
     long total_done  = 0;
     long total_total = 0;
     for (int i = 0; i < g_num_workers; i++) {
-        total_done  += g_lines_done[i];
-        total_total += g_lines_total[i];
+        total_done  += g_bytes_done[i];
+        total_total += g_bytes_total[i];
     }
     int total_pct = (total_total > 0) ? (int)(total_done * 100 / total_total) : 0;
     if (total_pct > 100) total_pct = 100;
@@ -45,7 +44,7 @@ static void draw_dashboard(void) {
     posix_writef(STDOUT_FILENO, "╠══════════════════════════════════════════╣\n");
 
     for (int i = 0; i < g_num_workers; i++) {
-        int pct = (g_lines_total[i] > 0) ? (int)(g_lines_done[i] * 100 / g_lines_total[i]) : 0;
+        int pct = (g_bytes_total[i] > 0) ? (int)(g_bytes_done[i] * 100 / g_bytes_total[i]) : 0;
         if (pct > 100) pct = 100;
 
         char bar[21];
@@ -68,19 +67,16 @@ static void draw_dashboard(void) {
     posix_writef(STDOUT_FILENO, "╚══════════════════════════════════════════╝\n");
 }
 
-/* Thread Monitora: Fica em loop a desenhar o dashboard até os workers acabarem */
-/* Thread monitora: atualiza o dashboard enquanto os workers processam */
 void *run_monitor_thread(void *arg) {
     (void)arg;
     while (!g_all_done) {
         draw_dashboard();
         usleep(100000);
     }
-    draw_dashboard(); // Desenha a última vez (aos 100%)
+    draw_dashboard();
     pthread_exit(NULL);
 }
 
-/* Gera relatorio final com estatisticas e salva em ficheiro se solicitado */
 void gerar_relatorio_threads(Metrics *total, char *modo, char *output_file) {
     int fd_out = STDOUT_FILENO;
     int fd_file = -1;
@@ -105,7 +101,7 @@ void gerar_relatorio_threads(Metrics *total, char *modo, char *output_file) {
         len += snprintf(buffer + len, sizeof(buffer) - len, "ERRORS          : %ld\n", total->count_error);
         len += snprintf(buffer + len, sizeof(buffer) - len, "CRITICAL        : %ld\n", total->count_critical);
     }
-    
+
     if (strcmp(modo, "traffic") == 0 || strcmp(modo, "full") == 0) {
         len += snprintf(buffer + len, sizeof(buffer) - len, "\n--- ESTATISTICAS DE TRAFEGO ---\n");
         len += snprintf(buffer + len, sizeof(buffer) - len, "INFO            : %ld\n", total->count_info);
@@ -114,14 +110,10 @@ void gerar_relatorio_threads(Metrics *total, char *modo, char *output_file) {
 
     len += snprintf(buffer + len, sizeof(buffer) - len, "=================================\n\n");
 
-    if (write(fd_out, buffer, len) < 0) {
-        perror("Erro ao escrever relatorio");
-    }
-
+    if (write(fd_out, buffer, len) < 0) perror("Erro ao escrever relatorio");
     if (fd_file >= 0) close(fd_file);
 }
 
-/* Funcao principal: processa logs com N threads */
 int main(int argc, char *argv[]) {
     g_dashboard_enabled = isatty(STDOUT_FILENO);
 
@@ -130,11 +122,10 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
-    char *diretorio   = argv[1];
-    int num_threads   = atoi(argv[2]);
-    char *modo        = argv[3];
-
-    int verbose = 0;
+    char *diretorio = argv[1];
+    int num_threads = atoi(argv[2]);
+    char *modo      = argv[3];
+    int verbose     = 0;
     char *output_file = NULL;
 
     for (int i = 4; i < argc; i++) {
@@ -147,6 +138,7 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
+    /* ── 1. Descobrir ficheiros ── */
     int capacidade = 10, total_ficheiros = 0;
     char **ficheiros = malloc(capacidade * sizeof(char *));
     DIR *dir = opendir(diretorio);
@@ -155,7 +147,7 @@ int main(int argc, char *argv[]) {
     struct dirent *entrada;
     while ((entrada = readdir(dir)) != NULL) {
         int len = strlen(entrada->d_name);
-        if ((len > 4 && strcmp(entrada->d_name + len - 4, ".log") == 0) ||
+        if ((len > 4 && strcmp(entrada->d_name + len - 4, ".log")  == 0) ||
             (len > 5 && strcmp(entrada->d_name + len - 5, ".json") == 0)) {
             if (total_ficheiros == capacidade) {
                 capacidade *= 2;
@@ -172,45 +164,54 @@ int main(int argc, char *argv[]) {
         posix_writef(STDOUT_FILENO, "Nenhum ficheiro .log ou .json encontrado.\n");
         exit(0);
     }
-    if (num_threads > total_ficheiros) num_threads = total_ficheiros;
+
     if (num_threads > MAX_THREADS) num_threads = MAX_THREADS;
 
+    /* ── 2. Calcular total de bytes e dividir em fatias iguais ── */
+    struct stat st;
+    off_t total_bytes = 0;
+    for (int i = 0; i < total_ficheiros; i++) {
+        if (stat(ficheiros[i], &st) == 0)
+            total_bytes += st.st_size;
+    }
+
+    if (num_threads > total_ficheiros) num_threads = total_ficheiros;
+
+    off_t bytes_por_thread = total_bytes / num_threads;
+
+    /* ── 3. Inicializar estruturas ── */
     Metrics global_metrics;
     init_metrics(&global_metrics);
     pthread_mutex_t metrics_mutex;
     pthread_mutex_init(&metrics_mutex, NULL);
 
-    pthread_t *threads = malloc(num_threads * sizeof(pthread_t));
-    ThreadArgs *args = malloc(num_threads * sizeof(ThreadArgs));
-    pthread_t monitor_thread; // A nossa Thread Extra para desenhar a interface!
-
-    int ficheiros_por_thread = total_ficheiros / num_threads;
+    pthread_t  *threads = malloc(num_threads * sizeof(pthread_t));
+    ThreadArgs *args    = malloc(num_threads * sizeof(ThreadArgs));
+    pthread_t   monitor_thread;
 
     g_num_workers = num_threads;
-    g_start_time = time(NULL);
-    memset(g_lines_done, 0, sizeof(g_lines_done));
-    memset(g_lines_total, 0, sizeof(g_lines_total));
+    g_start_time  = time(NULL);
+    memset(g_bytes_done,  0, sizeof(g_bytes_done));
+    memset(g_bytes_total, 0, sizeof(g_bytes_total));
     g_all_done = 0;
 
     if (g_dashboard_enabled) {
-        // Imprime linhas em branco suficientes para o dashboard não sobrescrever prints anteriores
         for (int i = 0; i < g_num_workers + 7; i++) posix_writef(STDOUT_FILENO, "\n");
-
-        /* 1. Lançar a Thread Monitora */
         pthread_create(&monitor_thread, NULL, run_monitor_thread, NULL);
     }
 
-    /* 2. Lançar as Worker Threads */
+    /* ── 4. Lançar threads com fatias de bytes ── */
     for (int i = 0; i < num_threads; i++) {
-        args[i].ficheiros = ficheiros;
-        args[i].inicio = i * ficheiros_por_thread;
-        args[i].fim = (i == num_threads - 1) ? total_ficheiros : args[i].inicio + ficheiros_por_thread;
-        args[i].worker_index = i; // Array começa no 0
-        args[i].verbose = verbose;
-        args[i].global_metrics = &global_metrics;
-        args[i].mutex = &metrics_mutex;
-        args[i].lines_done = &g_lines_done[i];     // Ponteiro para o partilhado
-        args[i].lines_total = &g_lines_total[i];   // Ponteiro para o partilhado
+        args[i].ficheiros       = ficheiros;
+        args[i].total_ficheiros = total_ficheiros;
+        args[i].byte_inicio     = (off_t)i * bytes_por_thread;
+        args[i].byte_fim        = (i == num_threads - 1) ? total_bytes : (off_t)(i + 1) * bytes_por_thread;
+        args[i].worker_index    = i;
+        args[i].verbose         = verbose;
+        args[i].global_metrics  = &global_metrics;
+        args[i].mutex           = &metrics_mutex;
+        args[i].bytes_done      = &g_bytes_done[i];
+        args[i].bytes_total     = &g_bytes_total[i];
 
         if (pthread_create(&threads[i], NULL, run_worker_thread, &args[i]) != 0) {
             perror("Erro ao criar thread");
@@ -218,27 +219,22 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    /* 3. Esperar pelos Trabalhadores */
-    for (int i = 0; i < num_threads; i++) {
+    /* ── 5. Esperar pelas threads ── */
+    for (int i = 0; i < num_threads; i++)
         pthread_join(threads[i], NULL);
-    }
 
     if (g_dashboard_enabled) {
-        /* 4. Trabalhadores acabaram! Avisar a Monitora e esperar por ela */
         g_all_done = 1;
         pthread_join(monitor_thread, NULL);
     }
 
-    /* 5. Destruir o trinco e gerar relatório */
     pthread_mutex_destroy(&metrics_mutex);
 
     long elapsed = (long)(time(NULL) - g_start_time);
-
     gerar_relatorio_threads(&global_metrics, modo, output_file);
     posix_writef(STDOUT_FILENO, "Tempo de processamento: %ldmin %02lds\n",
                  elapsed / 60, elapsed % 60);
 
-    /* 6. Limpezas */
     for (int i = 0; i < total_ficheiros; i++) free(ficheiros[i]);
     free(ficheiros);
     free(threads);
