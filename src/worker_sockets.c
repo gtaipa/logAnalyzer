@@ -1,313 +1,334 @@
 /**
  * @file worker_sockets.c
- * @brief Processo FILHO - Arquitectura Multi-Processo com Sockets Unix Domain
- * @author Implementação do Analisador de Logs
- * @version 1.0
- * @date 2026
- * 
+ * @brief Processo filho para análise paralela de logs com comunicação via Unix Domain Sockets.
+ *
  * @details
- * Implementação da Fase 1A (15% do projeto) com sockets Unix Domain.
- * Cada processo filho conecta-se ao servidor pai, recebe configuração
- * (intervalo de bytes), processa ficheiros, envia progresso e resultado via socket.
- * 
- * FLUXO:
- *  1. Conecta ao servidor pai via Unix Domain Socket
- *  2. Recebe MSG_CONFIG com byte_inicio, byte_fim, worker_index
- *  3. Processa ficheiros no intervalo [byte_inicio, byte_fim)
- *  4. Envia MSG_PROGRESSO a cada 100 linhas
- *  5. Envia MSG_RESULTADO com métricas finais e top-10 IPs
- * 
- * COMUNICAÇÃO:
- *  - Bidirecional: filho lê config, depois escreve progresso/resultado
- *  - MSG_CONFIG: int(tipo) + WorkerConfig struct
- *  - MSG_PROGRESSO: int(tipo) + ProgressUpdate struct
- *  - MSG_RESULTADO: int(tipo) + WorkerResult struct
+ * Cada processo filho conecta-se ao servidor pai via Unix Domain Socket, recebe a
+ * configuração da sua fatia [byte_inicio, byte_fim) e envia progresso e resultado
+ * de volta pelo mesmo socket (comunicação bidirecional).
+ *
+ * Fluxo de execução do processo filho:
+ *  1. Ligar ao servidor pai via connect_to_server() (com retry automático).
+ *  2. Ler MSG_CONFIG: int(tipo) + WorkerConfig com byte_inicio, byte_fim, worker_index.
+ *  3. Processar ficheiros no intervalo recebido via processar_por_bytes().
+ *  4. Enviar MSG_PROGRESSO a cada 100 linhas.
+ *  5. Enviar MSG_RESULTADO com métricas finais e top-10 IPs.
+ *  6. Fechar o socket para sinalizar EOF ao pai.
+ *
+ * Protocolo de mensagens (bidirecional):
+ *  - pai → filho: MSG_CONFIG  (tipo 0) + WorkerConfig
+ *  - filho → pai: MSG_PROGRESSO (tipo 1) + ProgressUpdate
+ *  - filho → pai: MSG_RESULTADO (tipo 2) + WorkerResult
  */
 
-#include "worker.h" // Incluir header do worker
-#include "parser.h" // Incluir header do parser
-#include "ipc.h" // Incluir header de IPC
+#include "worker.h"
+#include "parser.h"
+#include "ipc.h"
 
-#include <stdio.h> // Incluir header com funções de I/O padrão
-#include <stdlib.h> // Incluir header com funções gerais
-#include <string.h> // Incluir header com funções de string
-#include <unistd.h> // Incluir header com funções POSIX
-#include <fcntl.h> // Incluir header com flags de ficheiro
-#include <errno.h> // Incluir header com variável de erro
-#include <sys/stat.h> // Incluir header com estruturas de ficheiro
-#include <sys/types.h> // Incluir header com tipos de dados
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
-#define BUF_SIZE  4096 // Definir tamanho do buffer
-#define LINHA_MAX  512 // Definir tamanho máximo de linha
+/** @brief Dimensão do buffer de leitura por invocação de read(2) (4 KiB — alinhado ao tamanho de página). */
+#define BUF_SIZE  4096
+
+/** @brief Comprimento máximo de uma linha de log aceite pelo parser (caracteres incluindo '\0'). */
+#define LINHA_MAX  512
 
 /**
- * @brief Envia mensagem de progresso ao servidor pai via socket
- * 
- * @param sock Descritor do socket ligado
- * @param worker_index Índice do worker
- * @param bytes_done Bytes já processados nesta quota
- * @param bytes_total Bytes totais desta quota
+ * @brief Envia uma mensagem de progresso ao processo pai via socket.
+ *
+ * @details Idêntico em semântica ao enviar_progresso de worker_pipes.c, mas escreve
+ * no socket bidirecional em vez de num pipe unidireccional. As escritas não usam
+ * writen() porque a perda ocasional de uma actualização de progresso não é fatal.
+ *
+ * @param sock         Descritor do socket ligado ao servidor pai.
+ * @param worker_index Índice deste worker, usado pelo pai para indexar o dashboard.
+ * @param bytes_done   Bytes já processados nesta quota.
+ * @param bytes_total  Total de bytes desta quota.
  */
-static void enviar_progresso(int sock, int worker_index, long bytes_done, long bytes_total) { // Função para enviar progresso
-    int tipo = MSG_PROGRESSO; // Atribuir tipo de mensagem
-    write(sock, &tipo, sizeof(tipo)); // Escrever tipo no socket
+static void enviar_progresso(int sock, int worker_index, long bytes_done, long bytes_total) {
+    int tipo = MSG_PROGRESSO;
+    write(sock, &tipo, sizeof(tipo));
 
-    ProgressUpdate pu; // Declarar estrutura de progresso
-    pu.pid          = getpid(); // Atribuir PID
-    pu.worker_index = worker_index; // Atribuir índice do worker
-    pu.bytes_done   = bytes_done; // Atribuir bytes processados
-    pu.bytes_total  = bytes_total; // Atribuir bytes totais
-    write(sock, &pu, sizeof(pu)); // Escrever progresso no socket
+    ProgressUpdate pu;
+    pu.pid          = getpid();
+    pu.worker_index = worker_index;
+    pu.bytes_done   = bytes_done;
+    pu.bytes_total  = bytes_total;
+    write(sock, &pu, sizeof(pu));
 }
 
 /**
- * @brief Prepara resultado final com métricas e top-10 IPs ordenados
- * 
- * @details
- * Ordena IPs por frequência (decrescente) via bubble sort.
- * Copia os 10 mais frequentes para resultado.
- * 
- * @param m Métricas acumuladas
- * @param r Estrutura de resultado a preencher
+ * @brief Ordena os IPs por frequência decrescente e prepara o resultado final.
+ *
+ * @details Usa bubble sort sobre os arrays paralelos ips[] e counts[] para ordenar
+ * por contagem decrescente. O algoritmo O(n²) é aceitável porque MAX_IPS é pequeno.
+ * Os 10 IPs mais frequentes são copiados para o resultado a enviar ao pai.
+ *
+ * @param m Métricas acumuladas durante o processamento da fatia.
+ * @param r Estrutura de resultado a preencher.
  */
-static void preparar_resultado(const Metrics *m, WorkerResult *r) { // Função para preparar resultado
-    memset(r, 0, sizeof(*r)); // Limpar estrutura
-    r->pid            = getpid(); // Atribuir PID
-    r->total_lines    = m->total_lines; // Atribuir total de linhas
-    r->count_debug    = m->count_debug; // Atribuir contagem DEBUG
-    r->count_info     = m->count_info; // Atribuir contagem INFO
-    r->count_warn     = m->count_warn; // Atribuir contagem WARN
-    r->count_error    = m->count_error; // Atribuir contagem ERROR
-    r->count_critical = m->count_critical; // Atribuir contagem CRITICAL
-    r->count_4xx      = m->count_4xx; // Atribuir contagem HTTP 4xx
-    r->count_5xx      = m->count_5xx; // Atribuir contagem HTTP 5xx
+static void preparar_resultado(const Metrics *m, WorkerResult *r) {
+    memset(r, 0, sizeof(*r));
+    r->pid            = getpid();
+    r->total_lines    = m->total_lines;
+    r->count_debug    = m->count_debug;
+    r->count_info     = m->count_info;
+    r->count_warn     = m->count_warn;
+    r->count_error    = m->count_error;
+    r->count_critical = m->count_critical;
+    r->count_4xx      = m->count_4xx;
+    r->count_5xx      = m->count_5xx;
 
-    char ips[MAX_IPS][IP_LEN]; // Declarar array para IPs
-    long counts[MAX_IPS]; // Declarar array para contagens
-    int n = m->ip_num; // Obter número de IPs
-    if (n > MAX_IPS) n = MAX_IPS; // Limitar número de IPs
+    /* Copiar tabela de IPs para arrays locais antes de ordenar */
+    char ips[MAX_IPS][IP_LEN];
+    long counts[MAX_IPS];
+    int  n = m->ip_num;
+    if (n > MAX_IPS) n = MAX_IPS;
 
-    for (int i = 0; i < n; i++) { // Ciclo para cada IP
-        strncpy(ips[i], m->ip_list[i], IP_LEN - 1); // Copiar IP
-        ips[i][IP_LEN - 1] = '\0'; // Terminar string
-        counts[i] = m->ip_count[i]; // Copiar contagem
+    for (int i = 0; i < n; i++) {
+        strncpy(ips[i], m->ip_list[i], IP_LEN - 1);
+        ips[i][IP_LEN - 1] = '\0';
+        counts[i] = m->ip_count[i];
     }
 
-    for (int i = 0; i < n - 1; i++) { // Ciclo externo bubble sort
-        for (int j = 0; j < n - i - 1; j++) { // Ciclo interno bubble sort
-            if (counts[j] < counts[j + 1]) { // Se contagem menor
-                long tmp_count = counts[j]; // Guardar temp
-                counts[j] = counts[j + 1]; // Mover maior
-                counts[j + 1] = tmp_count; // Colocar menor
+    /* Bubble sort por contagem decrescente; os arrays ips[] e counts[] são co-ordenados */
+    for (int i = 0; i < n - 1; i++) {
+        for (int j = 0; j < n - i - 1; j++) {
+            if (counts[j] < counts[j + 1]) {
+                long tmp_count  = counts[j];
+                counts[j]       = counts[j + 1];
+                counts[j + 1]   = tmp_count;
 
-                char tmp_ip[IP_LEN]; // Declarar IP temp
-                strncpy(tmp_ip, ips[j], IP_LEN); // Guardar IP temp
-                strncpy(ips[j], ips[j + 1], IP_LEN); // Mover IP maior
-                strncpy(ips[j + 1], tmp_ip, IP_LEN); // Colocar IP menor
+                char tmp_ip[IP_LEN];
+                strncpy(tmp_ip,     ips[j],     IP_LEN);
+                strncpy(ips[j],     ips[j + 1], IP_LEN);
+                strncpy(ips[j + 1], tmp_ip,     IP_LEN);
             }
         }
     }
 
-    int limite = n < 10 ? n : 10; // Definir limite até 10
-    for (int i = 0; i < limite; i++) { // Ciclo para top 10
-        strncpy(r->top_ips[i], ips[i], IP_LEN - 1); // Copiar IP
-        r->top_ips[i][IP_LEN - 1] = '\0'; // Terminar string
-        r->top_ips_counts[i] = counts[i]; // Copiar contagem
+    /* Copiar os 10 IPs mais frequentes para o resultado */
+    int limite = n < 10 ? n : 10;
+    for (int i = 0; i < limite; i++) {
+        strncpy(r->top_ips[i], ips[i], IP_LEN - 1);
+        r->top_ips[i][IP_LEN - 1] = '\0';
+        r->top_ips_counts[i]       = counts[i];
     }
 
-    r->num_alerts = m->num_alerts < MAX_ALERTS ? m->num_alerts : MAX_ALERTS; // Atribuir alertas
-    for (int i = 0; i < r->num_alerts; i++) { // Ciclo para cada alerta
-        strncpy(r->alerts[i], m->alerts[i], ALERT_LEN - 1); // Copiar alerta
-        r->alerts[i][ALERT_LEN - 1] = '\0'; // Terminar string
+    r->num_alerts = m->num_alerts < MAX_ALERTS ? m->num_alerts : MAX_ALERTS;
+    for (int i = 0; i < r->num_alerts; i++) {
+        strncpy(r->alerts[i], m->alerts[i], ALERT_LEN - 1);
+        r->alerts[i][ALERT_LEN - 1] = '\0';
     }
 }
 
 /**
- * @brief Envia resultado final ao servidor pai via socket
- * 
- * @param sock Descritor do socket ligado
- * @param m Métricas acumuladas
+ * @brief Envia o resultado final ao processo pai via socket.
+ *
+ * @param sock Descritor do socket ligado ao servidor pai.
+ * @param m    Métricas acumuladas a serializar.
  */
-static void enviar_resultado(int sock, Metrics *m) { // Função para enviar resultado
-    int tipo = MSG_RESULTADO; // Atribuir tipo
-    write(sock, &tipo, sizeof(tipo)); // Escrever tipo no socket
+static void enviar_resultado(int sock, Metrics *m) {
+    int tipo = MSG_RESULTADO;
+    write(sock, &tipo, sizeof(tipo));
 
-    WorkerResult r; // Declarar resultado
-    preparar_resultado(m, &r); // Preparar resultado
-    write(sock, &r, sizeof(r)); // Escrever resultado no socket
+    WorkerResult r;
+    preparar_resultado(m, &r);
+    write(sock, &r, sizeof(r));
 }
 
 /**
- * @brief Processa intervalo de bytes específico com leitura via lseek
- * 
- * @details
- * Itera sobre ficheiros, calculando intersecção com intervalo [byte_inicio, byte_fim).
- * Para cada ficheiro, usa lseek() para saltar para byte_inicio local.
- * Lê linhas, parseia e atualiza métricas. Envia progresso a cada 100 linhas.
- * 
- * @param ficheiros Array de caminhos de ficheiros
- * @param total_ficheiros Número de ficheiros
- * @param m Métricas a preencher
- * @param sock Socket para enviar progresso/resultado
- * @param worker_index Índice do worker
- * @param byte_inicio Byte inicial (inclusivo)
- * @param byte_fim Byte final (exclusivo)
- * @param verbose Flag para saída detalhada
+ * @brief Processa a fatia [byte_inicio, byte_fim) dos ficheiros e envia progresso via socket.
+ *
+ * @details Itera sobre os ficheiros calculando a intersecção com o intervalo recebido.
+ * Para cada ficheiro, usa lseek(2) para saltar para local_start e alinha à próxima
+ * fronteira de linha antes de iniciar o parsing. O progresso é enviado a cada 100 linhas.
+ *
+ * @param ficheiros       Array de caminhos dos ficheiros de log.
+ * @param total_ficheiros Número de ficheiros.
+ * @param m               Estrutura de métricas a preencher.
+ * @param sock            Socket para envio de progresso ao pai.
+ * @param worker_index    Índice deste worker.
+ * @param byte_inicio     Offset global inicial (inclusivo).
+ * @param byte_fim        Offset global final (exclusivo).
+ * @param verbose         Se não-zero, imprime informação de debug no stdout.
  */
-static void processar_por_bytes(char **ficheiros, int total_ficheiros, Metrics *m, // Função para processar bytes
+static void processar_por_bytes(char **ficheiros, int total_ficheiros, Metrics *m,
                                 int sock, int worker_index,
                                 off_t byte_inicio, off_t byte_fim, int verbose) {
-    off_t quota         = byte_fim - byte_inicio; // Calcular quota
-    off_t global_offset = 0; // Inicializar offset global
-    long  linhas_feitas = 0; // Inicializar contador de linhas
+    off_t quota         = byte_fim - byte_inicio;
+    off_t global_offset = 0;
+    long  linhas_feitas = 0;
 
-    char buf[BUF_SIZE]; // Declarar buffer
-    char linha[LINHA_MAX]; // Declarar linha
+    char buf[BUF_SIZE];
+    char linha[LINHA_MAX];
 
-    for (int i = 0; i < total_ficheiros; i++) { // Ciclo para cada ficheiro
-        struct stat st; // Declarar estrutura de stats
-        if (stat(ficheiros[i], &st) != 0) continue; // Se erro, continuar
-        off_t fsize = st.st_size; // Obter tamanho
+    for (int i = 0; i < total_ficheiros; i++) {
+        struct stat st;
+        if (stat(ficheiros[i], &st) != 0) continue;
+        off_t fsize = st.st_size;
 
-        if (global_offset + fsize <= byte_inicio) { // Se antes do início
-            global_offset += fsize; // Avançar offset
-            continue; // Continuar
+        /* Ficheiro completamente anterior à fatia: avançar offset e continuar */
+        if (global_offset + fsize <= byte_inicio) {
+            global_offset += fsize;
+            continue;
         }
-        if (global_offset >= byte_fim) break; // Se depois do fim, parar
+        /* Ficheiro completamente posterior à fatia: não há mais dados a processar */
+        if (global_offset >= byte_fim) break;
 
-        off_t local_start = (byte_inicio > global_offset) ? byte_inicio - global_offset : 0; // Calcular início
-        off_t local_end   = (byte_fim < global_offset + fsize) ? byte_fim - global_offset : fsize; // Calcular fim
+        off_t local_start = (byte_inicio > global_offset) ? byte_inicio - global_offset : 0;
+        off_t local_end   = (byte_fim < global_offset + fsize) ? byte_fim - global_offset : fsize;
 
-        int fd = open(ficheiros[i], O_RDONLY); // Abrir ficheiro
-        if (fd < 0) { global_offset += fsize; continue; } // Se erro, continuar
+        int fd = open(ficheiros[i], O_RDONLY);
+        if (fd < 0) { global_offset += fsize; continue; }
 
-        if (verbose) // Se verbose
-            printf("[Worker %d] %s local [%lld-%lld]\n", // Imprimir
+        if (verbose)
+            printf("[Worker %d] %s local [%lld-%lld]\n",
                    worker_index, ficheiros[i],
                    (long long)local_start, (long long)local_end);
 
-        if (lseek(fd, local_start, SEEK_SET) < 0) { // Se erro no seek
-            perror("lseek"); // Imprimir erro
-            close(fd); // Fechar ficheiro
-            global_offset += fsize; // Avançar offset
-            continue; // Continuar
+        if (lseek(fd, local_start, SEEK_SET) < 0) {
+            perror("lseek");
+            close(fd);
+            global_offset += fsize;
+            continue;
         }
 
-        off_t file_pos = local_start; // Inicializar posição
+        off_t file_pos = local_start;
 
-        if (local_start > 0) { // Se não no início
-            char c; // Declarar caracter
-            ssize_t r; // Declarar bytes
-            while ((r = read(fd, &c, 1)) == 1) { // Ciclo de leitura
-                file_pos++; // Avançar posição
-                if (c == '\n') break; // Se newline, sair
+        /*
+         * Alinhamento de linha: se local_start > 0, o cursor pode estar a meio de
+         * uma linha pertencente ao worker anterior. Avançar byte a byte até ao '\n'.
+         */
+        if (local_start > 0) {
+            char    c;
+            ssize_t r;
+            while ((r = read(fd, &c, 1)) == 1) {
+                file_pos++;
+                if (c == '\n') break;
             }
-            if (r <= 0) { // Se EOF ou erro
-                close(fd); // Fechar ficheiro
-                global_offset += fsize; // Avançar offset
-                continue; // Continuar
+            if (r <= 0) {
+                close(fd);
+                global_offset += fsize;
+                continue;
             }
         }
 
-        int len  = 0; // Inicializar comprimento
-        int done = 0; // Inicializar done
-        LogFormat fmt = FORMAT_UNKNOWN; // Inicializar formato
+        int len  = 0;
+        int done = 0;
+        LogFormat fmt = FORMAT_UNKNOWN;
 
-        while (!done) { // Ciclo principal
-            ssize_t n = read(fd, buf, BUF_SIZE); // Ler do ficheiro
-            if (n <= 0) break; // Se EOF, sair
+        while (!done) {
+            ssize_t n = read(fd, buf, BUF_SIZE);
+            if (n <= 0) break;
 
-            for (int b = 0; b < (int)n && !done; b++) { // Ciclo para bytes
-                char c = buf[b]; // Obter caracter
-                file_pos++; // Avançar posição
+            for (int b = 0; b < (int)n && !done; b++) {
+                char c = buf[b];
+                file_pos++;
 
-                if (c == '\n') { // Se newline
-                    if (len > 0) { // Se linha tem conteúdo
-                        linha[len] = '\0'; // Terminar string
-                        if (fmt == FORMAT_UNKNOWN) fmt = detect_format(linha); // Detetar formato
-                        LogEntry entrada; // Declarar entrada
-                        if (parse_line(linha, fmt, &entrada) == 0) // Se parsing ok
-                            update_metrics(m, &entrada); // Atualizar métricas
-                        len = 0; // Resetar comprimento
+                if (c == '\n') {
+                    if (len > 0) {
+                        linha[len] = '\0';
+                        if (fmt == FORMAT_UNKNOWN) fmt = detect_format(linha);
+                        LogEntry entrada;
+                        if (parse_line(linha, fmt, &entrada) == 0)
+                            update_metrics(m, &entrada);
+                        len = 0;
                     }
 
-                    linhas_feitas++; // Incrementar contador
-                    if (linhas_feitas % 100 == 0) { // A cada 100 linhas
-                        off_t bytes_done = global_offset + file_pos - byte_inicio; // Calcular bytes
-                        if (bytes_done > quota) bytes_done = quota; // Limitar
-                        enviar_progresso(sock, worker_index, // Enviar progresso
+                    linhas_feitas++;
+                    if (linhas_feitas % 100 == 0) {
+                        off_t bytes_done = global_offset + file_pos - byte_inicio;
+                        if (bytes_done > quota) bytes_done = quota;
+                        enviar_progresso(sock, worker_index,
                                          (long)bytes_done, (long)quota);
                     }
 
-                    if (file_pos >= local_end) done = 1; // Se passou fim, marcar done
+                    if (file_pos >= local_end) done = 1;
 
-                } else if (c != '\r') { // Se não carriage return
-                    if (len < LINHA_MAX - 1) linha[len++] = c; // Adicionar caracter
+                } else if (c != '\r') {
+                    if (len < LINHA_MAX - 1) linha[len++] = c;
                 }
             }
         }
 
-        if (len > 0) { // Se linha tem conteúdo no fim
-            linha[len] = '\0'; // Terminar string
-            if (fmt == FORMAT_UNKNOWN) fmt = detect_format(linha); // Detetar formato
-            LogEntry entrada; // Declarar entrada
-            if (parse_line(linha, fmt, &entrada) == 0) // Se parsing ok
-                update_metrics(m, &entrada); // Atualizar métricas
+        /* Tratar última linha sem '\n' */
+        if (len > 0) {
+            linha[len] = '\0';
+            if (fmt == FORMAT_UNKNOWN) fmt = detect_format(linha);
+            LogEntry entrada;
+            if (parse_line(linha, fmt, &entrada) == 0)
+                update_metrics(m, &entrada);
         }
 
-        close(fd); // Fechar ficheiro
-        global_offset += fsize; // Avançar offset
+        close(fd);
+        global_offset += fsize;
     }
 }
 
 /**
- * @brief Função principal do processo filho - conecta ao servidor e processa bytes
- * 
- * @details
- * Cada worker filho conecta ao servidor pai, recebe configuração (intervalo de bytes),
- * processa ficheiros nesse intervalo, envia progresso e resultado via socket.
- * 
- * @param ficheiros Array de caminhos de ficheiros
- * @param total_ficheiros Número de ficheiros
- * @param num_processos Número total de workers (não utilizado)
- * @param worker_index_original Índice original (não utilizado)
- * @param verbose Flag para saída detalhada
+ * @brief Ponto de entrada do processo filho — conecta ao servidor e processa a fatia atribuída.
+ *
+ * @details O pai já foi forked antes desta chamada. O filho conecta ao servidor pai via
+ * Unix Domain Socket, lê a configuração (WorkerConfig com os limites da sua fatia),
+ * processa os ficheiros e envia progresso + resultado de volta pelo socket.
+ *
+ * Os parâmetros num_processos e worker_index_original não são utilizados porque a
+ * configuração efectiva (worker_index, byte_inicio, byte_fim) é recebida do servidor
+ * via MSG_CONFIG — isto permite que o pai atribua fatias dinamicamente após o fork.
+ *
+ * @param ficheiros              Array de caminhos dos ficheiros de log.
+ * @param total_ficheiros        Número de ficheiros.
+ * @param num_processos          Não utilizado (configuração recebida via socket).
+ * @param worker_index_original  Não utilizado (configuração recebida via socket).
+ * @param verbose                Se não-zero, imprime informação de debug no stdout.
  */
-void run_worker(char **ficheiros, int total_ficheiros, int num_processos, int worker_index_original, int verbose) { // Função principal do worker
-    (void)num_processos; // Não usar parâmetro
-    (void)worker_index_original; // Não usar parâmetro
+void run_worker(char **ficheiros, int total_ficheiros, int num_processos, int worker_index_original, int verbose) {
+    (void)num_processos;        /* configuração recebida via MSG_CONFIG */
+    (void)worker_index_original;
 
-    int sock = connect_to_server(); // Ligar ao servidor
-    if (sock < 0) { perror("connect_to_server"); exit(1); } // Se erro, sair
+    int sock = connect_to_server();
+    if (sock < 0) { perror("connect_to_server"); exit(1); }
 
-    int tipo; // Declarar tipo
-    read(sock, &tipo, sizeof(tipo)); // Ler tipo
+    /* Ler o tipo da primeira mensagem; deve ser sempre MSG_CONFIG */
+    int tipo;
+    read(sock, &tipo, sizeof(tipo));
 
-    if (tipo != MSG_CONFIG) { // Se tipo errado
-        fprintf(stderr, "Worker esperava MSG_CONFIG, recebeu tipo %d\n", tipo); // Imprimir erro
-        exit(1); // Sair com erro
+    if (tipo != MSG_CONFIG) {
+        fprintf(stderr, "Worker esperava MSG_CONFIG, recebeu tipo %d\n", tipo);
+        exit(1);
     }
 
-    WorkerConfig cfg; // Declarar config
-    read(sock, &cfg, sizeof(cfg)); // Ler config
+    WorkerConfig cfg;
+    read(sock, &cfg, sizeof(cfg));
 
-    int   worker_index = cfg.worker_index; // Obter índice
-    off_t byte_inicio  = cfg.byte_inicio; // Obter início
-    off_t byte_fim     = cfg.byte_fim; // Obter fim
-    off_t quota        = byte_fim - byte_inicio; // Calcular quota
+    int   worker_index = cfg.worker_index;
+    off_t byte_inicio  = cfg.byte_inicio;
+    off_t byte_fim     = cfg.byte_fim;
+    off_t quota        = byte_fim - byte_inicio;
 
-    if (verbose) // Se verbose
-        printf("[Worker %d (PID %d)] intervalo bytes: [%lld, %lld) quota=%lld\n", // Imprimir
+    if (verbose)
+        printf("[Worker %d (PID %d)] intervalo bytes: [%lld, %lld) quota=%lld\n",
                worker_index, (int)getpid(),
                (long long)byte_inicio, (long long)byte_fim, (long long)quota);
 
-    Metrics m; // Declarar métricas
-    init_metrics(&m); // Inicializar métricas
+    Metrics m;
+    init_metrics(&m);
 
-    processar_por_bytes(ficheiros, total_ficheiros, &m, // Processar bytes
+    processar_por_bytes(ficheiros, total_ficheiros, &m,
                         sock, worker_index, byte_inicio, byte_fim, verbose);
 
-    enviar_progresso(sock, worker_index, (long)quota, (long)quota); // Enviar progresso final
-    enviar_resultado(sock, &m); // Enviar resultado
-    close(sock); // Fechar socket
+    /* Progresso final a 100 % antes de enviar o resultado */
+    enviar_progresso(sock, worker_index, (long)quota, (long)quota);
+    enviar_resultado(sock, &m);
+
+    /* Fechar o socket sinaliza EOF ao pai, que decrementa o contador de resultados pendentes */
+    close(sock);
 }
