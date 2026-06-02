@@ -1,282 +1,319 @@
 /**
  * @file worker_pipes.c
- * @brief Processo FILHO - Arquitectura Multi-Processo com Pipes
- * @author Implementação do Analisador de Logs
- * @version 1.0
- * @date 2026
- * 
+ * @brief Processo filho para análise paralela de logs com comunicação via pipes POSIX.
+ *
  * @details
- * Implementação da Fase 1A (15% do projeto).
- * Cada processo filho processa um intervalo de bytes específico dos ficheiros.
- * Comunica progresso e resultados finais via pipe POSIX ao processo pai.
- * 
- * FLUXO:
- *  1. Recebe intervalo de bytes [byte_inicio, byte_fim)
- *  2. Para cada ficheiro, calcula intersecção com intervalo
- *  3. Usa lseek() para saltar para byte_inicio local no ficheiro
- *  4. Lê linhas e parseia até atingir byte_fim
- *  5. A cada 100 linhas, envia MSG_PROGRESSO ao pai
- *  6. No fim, envia MSG_RESULTADO com métricas finais e top-10 IPs
- * 
- * COMUNICAÇÃO:
- *  - MSG_PROGRESSO: int(tipo) + ProgressUpdate struct
- *  - MSG_RESULTADO: int(tipo) + WorkerResult struct
+ * Cada processo filho recebe uma fatia [byte_inicio, byte_fim) do espaço de endereçamento
+ * virtual formado pela concatenação lógica de todos os ficheiros de log e comunica
+ * o seu progresso e resultado ao pai exclusivamente através de um pipe unidireccional.
+ *
+ * Fluxo de execução do processo filho:
+ *  1. Receber os limites [byte_inicio, byte_fim) como argumentos directos da função.
+ *  2. Para cada ficheiro, calcular a intersecção local com o intervalo global.
+ *  3. Usar lseek(2) para posicionar o cursor e alinhar à fronteira da linha seguinte.
+ *  4. Ler em blocos de BUF_SIZE bytes, parsear e acumular métricas locais.
+ *  5. A cada 100 linhas, enviar MSG_PROGRESSO ao pai (int + ProgressUpdate).
+ *  6. No fim, enviar MSG_RESULTADO com métricas finais e top-10 IPs (int + WorkerResult).
+ *
+ * Protocolo de mensagens (unidirecional: filho → pai):
+ *  - MSG_PROGRESSO (tipo 1): int + ProgressUpdate
+ *  - MSG_RESULTADO (tipo 2): int + WorkerResult
  */
 
-#include "ipc.h" // Incluir header com definições de IPC
-#include "parser.h" // Incluir header com funções de parsing
-#include "posix_io.h" // Incluir header com funções de I/O POSIX
-#include "worker.h" // Incluir header com definições do worker
+#include "ipc.h"
+#include "parser.h"
+#include "posix_io.h"
+#include "worker.h"
 
-#include <errno.h> // Incluir header com variável de erro
-#include <fcntl.h> // Incluir header com flags de ficheiro
-#include <stdio.h> // Incluir header com funções de I/O padrão
-#include <stdlib.h> // Incluir header com funções gerais
-#include <string.h> // Incluir header com funções de string
-#include <sys/stat.h> // Incluir header com estruturas de ficheiro
-#include <sys/types.h> // Incluir header com tipos de dados
-#include <unistd.h> // Incluir header com funções POSIX
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 
-#define BUF_SIZE       4096 // Definir tamanho do buffer de leitura
-#define LINE_MAX_LOCAL 512 // Definir tamanho máximo de uma linha local
-#define MSG_PROGRESSO 1 // Definir tipo de mensagem de progresso
-#define MSG_RESULTADO 2 // Definir tipo de mensagem de resultado
+/** @brief Dimensão do buffer de leitura por invocação de read(2) (4 KiB — alinhado ao tamanho de página). */
+#define BUF_SIZE       4096
+
+/** @brief Comprimento máximo de uma linha de log aceite pelo parser (caracteres incluindo '\0'). */
+#define LINE_MAX_LOCAL 512
+
+/** @brief Tipo de mensagem de progresso enviada periodicamente ao processo pai. */
+#define MSG_PROGRESSO  1
+
+/** @brief Tipo de mensagem de resultado final enviada ao processo pai após concluir a fatia. */
+#define MSG_RESULTADO  2
 
 /**
- * @brief Envia mensagem de progresso ao processo pai via pipe
- * 
- * @param pipe_fd Descritor de ficheiro do pipe de escrita
- * @param worker_index Índice do worker (0..N-1)
- * @param bytes_done Bytes já processados nesta quota
- * @param bytes_total Bytes totais desta quota
+ * @brief Envia uma mensagem de progresso ao processo pai via pipe.
+ *
+ * @details A mensagem é composta por um inteiro de tipo (MSG_PROGRESSO) seguido de uma
+ * estrutura ProgressUpdate. O pai usa estes dados para actualizar o dashboard de barras
+ * de progresso em tempo real. As escritas não usam writen() porque um progresso perdido
+ * não é fatal — o dashboard simplesmente não actualiza nesse ciclo.
+ *
+ * @param pipe_fd     Descritor do extremo de escrita do pipe.
+ * @param worker_index Índice deste worker (0..N-1), usado pelo pai para indexar o dashboard.
+ * @param bytes_done  Bytes já processados nesta quota.
+ * @param bytes_total Total de bytes desta quota (denominador da percentagem).
  */
-static void enviar_progresso(int pipe_fd, int worker_index, long bytes_done, long bytes_total) { // Função para enviar progresso ao pai
-    int tipo = MSG_PROGRESSO; // Atribuir tipo de mensagem
-    write(pipe_fd, &tipo, sizeof(tipo)); // Escrever tipo no pipe
+static void enviar_progresso(int pipe_fd, int worker_index, long bytes_done, long bytes_total) {
+    int tipo = MSG_PROGRESSO;
+    write(pipe_fd, &tipo, sizeof(tipo));
 
-    ProgressUpdate pu; // Declarar estrutura de progresso
-    pu.pid          = getpid(); // Atribuir PID do processo
-    pu.worker_index = worker_index; // Atribuir índice do worker
-    pu.bytes_done   = bytes_done; // Atribuir bytes processados
-    pu.bytes_total  = bytes_total; // Atribuir bytes totais
-    write(pipe_fd, &pu, sizeof(pu)); // Escrever estrutura no pipe
+    ProgressUpdate pu;
+    pu.pid          = getpid();
+    pu.worker_index = worker_index;
+    pu.bytes_done   = bytes_done;
+    pu.bytes_total  = bytes_total;
+    write(pipe_fd, &pu, sizeof(pu));
 }
 
 /**
- * @brief Prepara resultado final com métricas e top-10 IPs ordenados
- * 
- * @details
- * Ordena IPs por frequência (decrescente) via bubble sort.
- * Copia os 10 mais frequentes para resultado.
- * 
- * @param m Métricas acumuladas
- * @param r Estrutura de resultado a preencher
+ * @brief Ordena os IPs por frequência decrescente e prepara o resultado final.
+ *
+ * @details Usa bubble sort sobre os arrays paralelos ips[] e counts[] para ordenar
+ * por contagem decrescente. O algoritmo O(n²) é aceitável porque MAX_IPS é pequeno
+ * (tipicamente ≤ 256 entradas). Os 10 IPs mais frequentes são copiados para o resultado.
+ *
+ * @param m Métricas acumuladas durante o processamento da fatia.
+ * @param r Estrutura de resultado a preencher com os dados a enviar ao pai.
  */
-static void preparar_resultado(const Metrics *m, WorkerResult *r) { // Função para preparar resultado final
-    memset(r, 0, sizeof(*r)); // Limpar estrutura de resultado
-    r->pid            = getpid(); // Atribuir PID do processo
-    r->total_lines    = m->total_lines; // Atribuir total de linhas
-    r->count_debug    = m->count_debug; // Atribuir contagem de DEBUG
-    r->count_info     = m->count_info; // Atribuir contagem de INFO
-    r->count_warn     = m->count_warn; // Atribuir contagem de WARN
-    r->count_error    = m->count_error; // Atribuir contagem de ERROR
-    r->count_critical = m->count_critical; // Atribuir contagem de CRITICAL
-    r->count_4xx      = m->count_4xx; // Atribuir contagem de HTTP 4xx
-    r->count_5xx      = m->count_5xx; // Atribuir contagem de HTTP 5xx
+static void preparar_resultado(const Metrics *m, WorkerResult *r) {
+    memset(r, 0, sizeof(*r));
+    r->pid            = getpid();
+    r->total_lines    = m->total_lines;
+    r->count_debug    = m->count_debug;
+    r->count_info     = m->count_info;
+    r->count_warn     = m->count_warn;
+    r->count_error    = m->count_error;
+    r->count_critical = m->count_critical;
+    r->count_4xx      = m->count_4xx;
+    r->count_5xx      = m->count_5xx;
 
-    char ips[MAX_IPS][IP_LEN]; // Declarar array para IPs
-    long counts[MAX_IPS]; // Declarar array para contagens
-    int n = m->ip_num; // Atribuir número de IPs
-    if (n > MAX_IPS) n = MAX_IPS; // Limitar número de IPs ao máximo
+    /* Copiar tabela de IPs para arrays locais antes de ordenar */
+    char ips[MAX_IPS][IP_LEN];
+    long counts[MAX_IPS];
+    int  n = m->ip_num;
+    if (n > MAX_IPS) n = MAX_IPS;
 
-    for (int i = 0; i < n; i++) { // Ciclo para cada IP
-        strncpy(ips[i], m->ip_list[i], IP_LEN - 1); // Copiar IP
-        ips[i][IP_LEN - 1] = '\0'; // Terminar string
-        counts[i] = m->ip_count[i]; // Copiar contagem
+    for (int i = 0; i < n; i++) {
+        strncpy(ips[i], m->ip_list[i], IP_LEN - 1);
+        ips[i][IP_LEN - 1] = '\0';
+        counts[i] = m->ip_count[i];
     }
 
-    for (int i = 0; i < n - 1; i++) { // Ciclo externo de bubble sort
-        for (int j = 0; j < n - i - 1; j++) { // Ciclo interno de bubble sort
-            if (counts[j] < counts[j + 1]) { // Se contagem menor que próxima
-                long tmp_count = counts[j]; // Guardar contagem temporária
-                counts[j] = counts[j + 1]; // Mover contagem maior
-                counts[j + 1] = tmp_count; // Colocar contagem menor
+    /* Bubble sort por contagem decrescente; os arrays ips[] e counts[] são co-ordenados */
+    for (int i = 0; i < n - 1; i++) {
+        for (int j = 0; j < n - i - 1; j++) {
+            if (counts[j] < counts[j + 1]) {
+                long tmp_count  = counts[j];
+                counts[j]       = counts[j + 1];
+                counts[j + 1]   = tmp_count;
 
-                char tmp_ip[IP_LEN]; // Declarar IP temporário
-                strncpy(tmp_ip, ips[j], IP_LEN); // Guardar IP temporário
-                strncpy(ips[j], ips[j + 1], IP_LEN); // Mover IP maior
-                strncpy(ips[j + 1], tmp_ip, IP_LEN); // Colocar IP menor
+                char tmp_ip[IP_LEN];
+                strncpy(tmp_ip,      ips[j],     IP_LEN);
+                strncpy(ips[j],      ips[j + 1], IP_LEN);
+                strncpy(ips[j + 1],  tmp_ip,     IP_LEN);
             }
         }
     }
 
-    int limite = n < 10 ? n : 10; // Definir limite até 10 IPs
-    for (int i = 0; i < limite; i++) { // Ciclo para os top 10 IPs
-        strncpy(r->top_ips[i], ips[i], IP_LEN - 1); // Copiar IP top
-        r->top_ips[i][IP_LEN - 1] = '\0'; // Terminar string
-        r->top_ips_counts[i] = counts[i]; // Copiar contagem top
+    /* Copiar os 10 IPs mais frequentes para o resultado */
+    int limite = n < 10 ? n : 10;
+    for (int i = 0; i < limite; i++) {
+        strncpy(r->top_ips[i], ips[i], IP_LEN - 1);
+        r->top_ips[i][IP_LEN - 1] = '\0';
+        r->top_ips_counts[i]       = counts[i];
     }
 
-    r->num_alerts = m->num_alerts < MAX_ALERTS ? m->num_alerts : MAX_ALERTS; // Atribuir número de alertas
-    for (int i = 0; i < r->num_alerts; i++) { // Ciclo para cada alerta
-        strncpy(r->alerts[i], m->alerts[i], ALERT_LEN - 1); // Copiar alerta
-        r->alerts[i][ALERT_LEN - 1] = '\0'; // Terminar string
+    r->num_alerts = m->num_alerts < MAX_ALERTS ? m->num_alerts : MAX_ALERTS;
+    for (int i = 0; i < r->num_alerts; i++) {
+        strncpy(r->alerts[i], m->alerts[i], ALERT_LEN - 1);
+        r->alerts[i][ALERT_LEN - 1] = '\0';
     }
 }
 
 /**
- * @brief Envia resultado final ao processo pai via pipe
- * 
- * @param pipe_fd Descritor de ficheiro do pipe de escrita
- * @param m Métricas acumuladas
+ * @brief Envia o resultado final ao processo pai via pipe.
+ *
+ * @details Serializa a estrutura WorkerResult (precedida pelo tipo MSG_RESULTADO)
+ * directamente no pipe. O pai lê a struct como um bloco contíguo após ler o tipo.
+ * Após esta chamada, o pipe deve ser fechado pelo chamador.
+ *
+ * @param pipe_fd Descritor do extremo de escrita do pipe.
+ * @param m       Métricas acumuladas a serializar.
  */
-static void enviar_resultado(int pipe_fd, Metrics *m) { // Função para enviar resultado final
-    int tipo = MSG_RESULTADO; // Atribuir tipo de mensagem
-    write(pipe_fd, &tipo, sizeof(tipo)); // Escrever tipo no pipe
+static void enviar_resultado(int pipe_fd, Metrics *m) {
+    int tipo = MSG_RESULTADO;
+    write(pipe_fd, &tipo, sizeof(tipo));
 
-    WorkerResult r; // Declarar estrutura de resultado
-    preparar_resultado(m, &r); // Preparar resultado
-    write(pipe_fd, &r, sizeof(r)); // Escrever resultado no pipe
+    WorkerResult r;
+    preparar_resultado(m, &r);
+    write(pipe_fd, &r, sizeof(r));
 }
 
 /**
- * @brief Função principal do processo filho - processa intervalo de bytes via pipe
- * 
- * @details
- * Processa ficheiros dentro do intervalo [byte_inicio, byte_fim).
- * Usa lseek() para saltar para posições específicas. Envia progresso
- * e resultado final via pipe ao pai.
- * 
- * @param ficheiros Array de caminhos de ficheiros
- * @param total_ficheiros Número de ficheiros
- * @param pipe_fd_write Descritor do pipe para escrita
- * @param worker_index Índice do worker
- * @param byte_inicio Byte inicial (inclusivo)
- * @param byte_fim Byte final (exclusivo)
- * @param verbose Flag para saída detalhada
+ * @brief Processa a fatia [byte_inicio, byte_fim) dos ficheiros de log e comunica com o pai via pipe.
+ *
+ * @details Esta função é o ponto de entrada do processo filho. Itera sobre todos os ficheiros,
+ * calculando a intersecção de cada um com o intervalo [byte_inicio, byte_fim) para determinar
+ * os offsets locais a processar. Usa lseek(2) para saltar directamente para local_start,
+ * alinha à próxima fronteira de linha se necessário e lê em blocos de BUF_SIZE bytes.
+ *
+ * O progresso é enviado ao pai a cada 100 linhas; o resultado final é enviado uma vez,
+ * seguido do fecho do pipe para sinalizar EOF ao processo pai.
+ *
+ * @param ficheiros       Array de caminhos absolutos dos ficheiros de log a analisar.
+ * @param total_ficheiros Número de entradas em @p ficheiros.
+ * @param pipe_fd_write   Descritor do extremo de escrita do pipe para comunicação com o pai.
+ * @param worker_index    Índice deste worker (0..N-1).
+ * @param byte_inicio     Offset global inicial (inclusivo) da fatia a processar.
+ * @param byte_fim        Offset global final (exclusivo) da fatia a processar.
+ * @param verbose         Se não-zero, imprime informação de debug no stdout.
  */
-void run_worker_pipe(char **ficheiros, int total_ficheiros, int pipe_fd_write, // Função principal do worker com pipes
+void run_worker_pipe(char **ficheiros, int total_ficheiros, int pipe_fd_write,
                      int worker_index, off_t byte_inicio, off_t byte_fim, int verbose) {
-    Metrics m; // Declarar estrutura de métricas
-    init_metrics(&m); // Inicializar métricas
+    Metrics m;
+    init_metrics(&m);
 
-    off_t quota          = byte_fim - byte_inicio; // Calcular quota de bytes
-    off_t global_offset  = 0; // Inicializar offset global
-    long  linhas_feitas  = 0; // Inicializar contador de linhas
+    off_t quota         = byte_fim - byte_inicio; /* total de bytes desta fatia */
+    off_t global_offset = 0; /* acumulador do espaço de endereçamento virtual percorrido */
+    long  linhas_feitas = 0; /* contador de linhas para cadência de envio de progresso */
 
-    char buf[BUF_SIZE]; // Declarar buffer de leitura
-    char linha[LINE_MAX_LOCAL]; // Declarar buffer de linha
+    char buf[BUF_SIZE];
+    char linha[LINE_MAX_LOCAL];
 
-    if (verbose) // Se modo verbose ativo
-        posix_writef(STDOUT_FILENO, // Escrever em STDOUT
+    if (verbose)
+        posix_writef(STDOUT_FILENO,
                      "[Worker %d PID %d] intervalo bytes: [%lld, %lld)\n",
                      worker_index, (int)getpid(),
                      (long long)byte_inicio, (long long)byte_fim);
 
-    for (int i = 0; i < total_ficheiros; i++) { // Ciclo para cada ficheiro
-        struct stat st; // Declarar estrutura de estatísticas
-        if (stat(ficheiros[i], &st) != 0) continue; // Se erro ao obter stats, continuar
-        off_t fsize = st.st_size; // Obter tamanho do ficheiro
+    for (int i = 0; i < total_ficheiros; i++) {
+        struct stat st;
+        if (stat(ficheiros[i], &st) != 0) continue; /* ficheiro inacessível: ignorar */
+        off_t fsize = st.st_size;
 
-        if (global_offset + fsize <= byte_inicio) { // Se ficheiro está completamente antes
-            global_offset += fsize; // Avançar offset global
-            continue; // Continuar com próximo ficheiro
+        /* Ficheiro completamente anterior à fatia: avançar offset e continuar */
+        if (global_offset + fsize <= byte_inicio) {
+            global_offset += fsize;
+            continue;
         }
-        if (global_offset >= byte_fim) break; // Se ficheiro está completamente depois, parar
+        /* Ficheiro completamente posterior à fatia: não há mais dados a processar */
+        if (global_offset >= byte_fim) break;
 
-        off_t local_start = (byte_inicio > global_offset) ? byte_inicio - global_offset : 0; // Calcular início local
-        off_t local_end   = (byte_fim < global_offset + fsize) ? byte_fim - global_offset : fsize; // Calcular fim local
+        /*
+         * Calcular offsets locais dentro deste ficheiro:
+         *   local_start: byte a partir do qual esta fatia começa (0 se o ficheiro
+         *                começa dentro da fatia ou antes dela).
+         *   local_end:   byte até ao qual ler (exclusivo); clampado a fsize.
+         */
+        off_t local_start = (byte_inicio > global_offset) ? byte_inicio - global_offset : 0;
+        off_t local_end   = (byte_fim < global_offset + fsize) ? byte_fim - global_offset : fsize;
 
-        int fd = open(ficheiros[i], O_RDONLY); // Abrir ficheiro para leitura
-        if (fd < 0) { global_offset += fsize; continue; } // Se erro, continuar
+        int fd = open(ficheiros[i], O_RDONLY);
+        if (fd < 0) { global_offset += fsize; continue; }
 
-        if (verbose) // Se modo verbose ativo
-            posix_writef(STDOUT_FILENO, // Escrever em STDOUT
+        if (verbose)
+            posix_writef(STDOUT_FILENO,
                          "[Worker %d] %s local [%lld-%lld]\n",
                          worker_index, ficheiros[i],
                          (long long)local_start, (long long)local_end);
 
-        if (lseek(fd, local_start, SEEK_SET) < 0) { // Se erro ao saltar para offset
-            perror("lseek"); // Imprimir erro
-            close(fd); // Fechar ficheiro
-            global_offset += fsize; // Avançar offset global
-            continue; // Continuar com próximo ficheiro
+        if (lseek(fd, local_start, SEEK_SET) < 0) {
+            perror("lseek");
+            close(fd);
+            global_offset += fsize;
+            continue;
         }
 
-        off_t file_pos = local_start; // Inicializar posição do ficheiro
+        off_t file_pos = local_start;
 
-        if (local_start > 0) { // Se não está no início do ficheiro
-            char c; // Declarar caracter
-            ssize_t r; // Declarar bytes lidos
-            while ((r = read(fd, &c, 1)) == 1) { // Ciclo enquanto ler caracteres
-                file_pos++; // Avançar posição
-                if (c == '\n') break; // Se encontrar newline, sair
+        /*
+         * Alinhamento de linha: se local_start > 0, o cursor pode estar a meio de
+         * uma linha pertencente ao worker anterior. Avançar byte a byte até ao '\n'
+         * para garantir que o parsing começa sempre numa linha completa.
+         */
+        if (local_start > 0) {
+            char    c;
+            ssize_t r;
+            while ((r = read(fd, &c, 1)) == 1) {
+                file_pos++;
+                if (c == '\n') break;
             }
-            if (r <= 0) { // Se erro ou EOF
-                close(fd); // Fechar ficheiro
-                global_offset += fsize; // Avançar offset global
-                continue; // Continuar com próximo ficheiro
+            if (r <= 0) {
+                close(fd);
+                global_offset += fsize;
+                continue;
             }
         }
 
-        int len  = 0; // Inicializar comprimento da linha
-        int done = 0; // Inicializar flag de conclusão
-        LogFormat fmt = FORMAT_UNKNOWN; // Inicializar formato de log
+        int len  = 0;
+        int done = 0;
+        LogFormat fmt = FORMAT_UNKNOWN; /* inferido na primeira linha válida */
 
-        while (!done) { // Ciclo enquanto não terminar
-            ssize_t n = read(fd, buf, BUF_SIZE); // Ler do ficheiro
-            if (n <= 0) break; // Se EOF ou erro, sair
+        while (!done) {
+            ssize_t n = read(fd, buf, BUF_SIZE);
+            if (n <= 0) break; /* EOF ou erro de I/O */
 
-            for (int b = 0; b < (int)n && !done; b++) { // Ciclo para cada byte
-                char c = buf[b]; // Obter caracter
-                file_pos++; // Avançar posição
+            for (int b = 0; b < (int)n && !done; b++) {
+                char c = buf[b];
+                file_pos++;
 
-                if (c == '\n') { // Se caracter é newline
-                    if (len > 0) { // Se linha tem conteúdo
-                        linha[len] = '\0'; // Terminar string
-                        if (fmt == FORMAT_UNKNOWN) fmt = detect_format(linha); // Detetar formato
-                        LogEntry entry; // Declarar entrada de log
-                        if (parse_line(linha, fmt, &entry) == 0) // Se parsing com sucesso
-                            update_metrics(&m, &entry); // Atualizar métricas
-                        len = 0; // Resetar comprimento
+                if (c == '\n') {
+                    if (len > 0) {
+                        linha[len] = '\0';
+                        if (fmt == FORMAT_UNKNOWN) fmt = detect_format(linha);
+                        LogEntry entry;
+                        if (parse_line(linha, fmt, &entry) == 0)
+                            update_metrics(&m, &entry);
+                        len = 0;
                     }
 
-                    linhas_feitas++; // Incrementar contador de linhas
-                    if (linhas_feitas % 100 == 0) { // A cada 100 linhas
-                        off_t bytes_done = global_offset + file_pos - byte_inicio; // Calcular bytes processados
-                        if (bytes_done > quota) bytes_done = quota; // Limitar aos bytes da quota
-                        enviar_progresso(pipe_fd_write, worker_index, // Enviar progresso
+                    linhas_feitas++;
+                    if (linhas_feitas % 100 == 0) {
+                        /* Enviar progresso periódico ao pai para actualização do dashboard */
+                        off_t bytes_done = global_offset + file_pos - byte_inicio;
+                        if (bytes_done > quota) bytes_done = quota;
+                        enviar_progresso(pipe_fd_write, worker_index,
                                          (long)bytes_done, (long)quota);
                     }
 
-                    if (file_pos >= local_end) done = 1; // Se passou fim, marcar como concluído
+                    if (file_pos >= local_end) done = 1;
 
-                } else if (c != '\r') { // Se não é carriage return
-                    if (len < LINE_MAX_LOCAL - 1) linha[len++] = c; // Adicionar caracter à linha
+                } else if (c != '\r') {
+                    /* Ignorar '\r' de terminadores CRLF (ficheiros Windows) */
+                    if (len < LINE_MAX_LOCAL - 1) linha[len++] = c;
                 }
             }
         }
 
-        if (len > 0) { // Se linha tem conteúdo no fim do ficheiro
-            linha[len] = '\0'; // Terminar string
-            if (fmt == FORMAT_UNKNOWN) fmt = detect_format(linha); // Detetar formato
-            LogEntry entry; // Declarar entrada de log
-            if (parse_line(linha, fmt, &entry) == 0) // Se parsing com sucesso
-                update_metrics(&m, &entry); // Atualizar métricas
+        /* Tratar última linha sem '\n' (ficheiro sem newline final ou done activado a meio) */
+        if (len > 0) {
+            linha[len] = '\0';
+            if (fmt == FORMAT_UNKNOWN) fmt = detect_format(linha);
+            LogEntry entry;
+            if (parse_line(linha, fmt, &entry) == 0)
+                update_metrics(&m, &entry);
         }
 
-        close(fd); // Fechar ficheiro
-        global_offset += fsize; // Avançar offset global
+        close(fd);
+        global_offset += fsize;
     }
 
-    enviar_progresso(pipe_fd_write, worker_index, (long)quota, (long)quota); // Enviar progresso final 100%
+    /* Progresso final a 100 % para que o dashboard marque este worker como concluído */
+    enviar_progresso(pipe_fd_write, worker_index, (long)quota, (long)quota);
 
-    enviar_resultado(pipe_fd_write, &m); // Enviar resultado final
+    enviar_resultado(pipe_fd_write, &m);
 
-    if (close(pipe_fd_write) == -1) { // Se erro ao fechar pipe
-        perror("close"); // Imprimir erro
-        exit(1); // Sair com erro
+    /* Fechar o pipe sinaliza EOF ao processo pai no select(); qualquer erro é fatal */
+    if (close(pipe_fd_write) == -1) {
+        perror("close");
+        exit(1);
     }
 
-    exit(0); // Sair com sucesso
+    exit(0);
 }
