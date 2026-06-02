@@ -1,238 +1,145 @@
 /**
  * @file main_basic.c
- * @brief Fase 1B — Arquitectura Multi-Processo Básica (sem IPC)
- *
+ * @brief Processo PAI - Arquitectura Multi-Processo Básica (sem IPC)
+ * @author Implementação do Analisador de Logs
+ * @version 1.0
+ * @date 2026
+ * 
  * @details
- * Implementação do Requisito B do enunciado (15% da Fase 1).
- *
- * ARQUITECTURA:
- *   - O PAI descobre todos os ficheiros .log/.json no directório indicado.
- *   - Divide a lista de ficheiros equitativamente entre N processos filho
- *     usando distribuição por blocos.
- *   - Cria N processos filho com fork().
- *   - Aguarda a conclusão de todos com waitpid().
- *
- * CADA FILHO (independente, sem IPC):
- *   - Recebe o seu subconjunto de ficheiros via variáveis locais após fork().
- *   - Para cada ficheiro: abre com open(), lê com read(), parseia e conta.
- *   - No final escreve os resultados em results_<pid>.txt com write().
- *   - Não existe NENHUMA comunicação entre processos durante a execução.
- *
- * FORMATO DE SAÍDA (uma linha por ficheiro em results_<pid>.txt):
- *   PID:<pid>;FICHEIRO:<nome>;LINHAS:<n>;ERRORS:<n>;WARNINGS:<n>
- *
- * DIFERENÇA face aos outros binários:
- *   - logAnalyzer_pipes    usa pipes anónimos (Req. C)
- *   - logAnalyzer_sockets  usa Unix Domain Sockets (Req. E)
- *   - logAnalyzer_basic    não usa IPC nenhum (este ficheiro, Req. B)
- *
- * USO:
- *   ./logAnalyzer_basic <diretorio_logs> <num_processos> <modo> [--verbose]
- *
- * EXEMPLO:
- *   ./logAnalyzer_basic datasets/apache 4 security --verbose
+ * Implementação da Fase 1B (15% do projeto).
+ * Estrutura multi-processo clássica sem mecanismos de IPC durante execução.
+ * 
+ * FLUXO:
+ *  1. Pai descobre ficheiros .log/.json
+ *  2. Divide lista entre N processos filho
+ *  3. Cria filhos com fork()
+ *  4. Aguarda conclusão com waitpid()
+ *  5. Cada filho processa de forma independente
+ *  6. Filhos escrevem resultados em ficheiros separados
+ * 
+ * USO: ./logAnalyzer_basic <diretorio> <num_processos> <modo> [--verbose]
  */
 
-/* ── Cabeçalhos POSIX obrigatórios ── */
-#include <dirent.h>   /* opendir, readdir, closedir                      */
-#include <errno.h>    /* errno, para validar strtol                       */
-#include <fcntl.h>    /* open(), O_RDONLY, O_WRONLY, O_CREAT              */
-#include <stdio.h>    /* snprintf, perror, fflush (auxiliares de formato) */
-#include <stdlib.h>   /* malloc, free, exit, strtol                       */
-#include <string.h>   /* memset, strncpy, strcmp, strrchr                 */
-#include <sys/stat.h> /* stat(), struct stat                               */
-#include <sys/types.h>/* pid_t, off_t, ssize_t                            */
-#include <sys/wait.h> /* waitpid(), WIFEXITED, WEXITSTATUS                */
-#include <unistd.h>   /* fork(), getpid(), read(), write(), close()       */
+#include <dirent.h> // Incluir header para navegação de diretórios
+#include <errno.h> // Incluir header com variável de erro
+#include <fcntl.h> // Incluir header com flags de ficheiro
+#include <stdio.h> // Incluir header com funções de I/O padrão
+#include <stdlib.h> // Incluir header com funções gerais
+#include <string.h> // Incluir header com funções de string
+#include <sys/stat.h> // Incluir header com estruturas de ficheiro
+#include <sys/types.h> // Incluir header com tipos de dados
+#include <sys/wait.h> // Incluir header com funções de espera
+#include <unistd.h> // Incluir header com funções POSIX
 
-/* ── Cabeçalhos do projecto ── */
-#include "parser.h"   /* LogEntry, Metrics, parse_line, detect_format, update_metrics */
-#include "posix_io.h" /* posix_writef() — printf seguro via write()                   */
+#include "parser.h" // Incluir header com funções de parsing
+#include "posix_io.h" // Incluir header com funções de I/O POSIX
 
-/** @brief Tamanho do buffer de leitura em bytes (lemos blocos de 4 KB de cada vez). */
-#define BUF_SIZE        4096
-
-/** @brief Comprimento máximo de uma linha de log (linhas mais longas são truncadas). */
-#define LINE_MAX_BASIC  512
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * processar_ficheiro
- *
- * Lê e parseia um único ficheiro de log usando exclusivamente chamadas POSIX.
- * As métricas extraídas são acumuladas em *m.
- * ═══════════════════════════════════════════════════════════════════════════ */
+#define BUF_SIZE        4096 // Definir tamanho do buffer de leitura
+#define LINE_MAX_BASIC  512 // Definir tamanho máximo de linha
 
 /**
- * @brief Processa um ficheiro de log e acumula as métricas em @p m.
- *
+ * @brief Processa um ficheiro de log e acumula métricas
+ * 
  * @details
- * Fluxo interno:
- *  1. open()   — abre o ficheiro em modo só-leitura (O_RDONLY).
- *  2. read()   — lê blocos de BUF_SIZE bytes (pode devolver menos).
- *  3. Byte-a-byte acumula caracteres numa linha local até encontrar '\\n'.
- *  4. detect_format() — detecta o formato do ficheiro (Apache/JSON/Syslog/Nginx).
- *  5. parse_line()    — interpreta a linha e preenche um LogEntry.
- *  6. update_metrics() — incrementa os contadores em *m.
- *  7. close()  — liberta o file descriptor.
- *
- * @note Usamos read() em vez de fread() porque o enunciado exige chamadas POSIX.
- *
- * @param caminho         Caminho completo para o ficheiro a processar.
- * @param m               Acumulador de métricas a preencher.
- * @param verbose         1 para imprimir diagnóstico por linha, 0 para silencioso.
- * @param pid             PID do processo filho (usado nas mensagens verbose).
- * @return 0 em sucesso, -1 se open() falhar.
+ * Abre ficheiro, lê byte a byte, acumula linhas e parseia.
+ * Utiliza exclusivamente chamadas POSIX (open, read, close).
+ * 
+ * @param caminho Caminho completo do ficheiro
+ * @param m Estrutura de métricas a preencher
+ * @param verbose Flag para output detalhado
+ * @param pid PID do processo (para mensagens)
+ * @return 0 em sucesso, -1 em erro de abertura
  */
-static int processar_ficheiro(const char *caminho, Metrics *m, int verbose, pid_t pid) {
-
-    /*
-     * open() — chamada POSIX para abrir ficheiros.
-     * O_RDONLY : abrir apenas para leitura.
-     * Retorna um file descriptor (inteiro ≥ 0) ou -1 em erro.
-     * NÃO usar fopen() — o enunciado §8.1 proíbe as funções da stdlib C.
-     */
-    int fd = open(caminho, O_RDONLY);
-    if (fd < 0) {
-        perror("open");   /* perror() imprime a mensagem de erro do SO */
-        return -1;
+static int processar_ficheiro(const char *caminho, Metrics *m, int verbose, pid_t pid) { // Função para processar ficheiro
+    int fd = open(caminho, O_RDONLY); // Abrir ficheiro para leitura
+    if (fd < 0) { // Se erro ao abrir
+        perror("open"); // Imprimir erro
+        return -1; // Retornar erro
     }
 
-    if (verbose)
-        posix_writef(STDOUT_FILENO, "[PID %d] A processar: %s\n", (int)pid, caminho);
+    if (verbose) // Se modo verbose
+        posix_writef(STDOUT_FILENO, "[PID %d] A processar: %s\n", (int)pid, caminho); // Imprimir mensagem
 
-    /* Buffer onde read() deposita os dados lidos do disco */
-    char buf[BUF_SIZE];
+    char buf[BUF_SIZE]; // Declarar buffer de leitura
+    char linha[LINE_MAX_BASIC]; // Declarar linha local
+    int  len = 0; // Inicializar comprimento da linha
 
-    /* Linha corrente em construção (acumulada byte a byte) */
-    char linha[LINE_MAX_BASIC];
-    int  len = 0;   /* número de bytes acumulados na linha actual */
+    LogFormat fmt = FORMAT_UNKNOWN; // Inicializar formato
 
-    /*
-     * Formato do ficheiro: detectado na primeira linha válida.
-     * FORMAT_UNKNOWN obriga detect_format() a ser chamado uma vez.
-     */
-    LogFormat fmt = FORMAT_UNKNOWN;
+    ssize_t n; // Declarar bytes lidos
 
-    ssize_t n;  /* número de bytes devolvidos por read() */
+    while ((n = read(fd, buf, BUF_SIZE)) > 0) { // Ciclo de leitura
+        for (ssize_t b = 0; b < n; b++) { // Ciclo para cada byte
+            char c = buf[b]; // Obter caracter
 
-    /*
-     * Ciclo de leitura com read().
-     * read() pode devolver MENOS bytes que BUF_SIZE (leitura parcial),
-     * por isso processamos cada byte individualmente dentro do bloco.
-     * Quando read() devolve 0 chegámos ao fim do ficheiro (EOF).
-     */
-    while ((n = read(fd, buf, BUF_SIZE)) > 0) {
-        for (ssize_t b = 0; b < n; b++) {
-            char c = buf[b];
+            if (c == '\n') { // Se newline
+                if (len > 0) { // Se linha tem conteúdo
+                    linha[len] = '\0'; // Terminar string
 
-            if (c == '\n') {
-                /* Fim de linha — processar o que acumulámos */
-                if (len > 0) {
-                    linha[len] = '\0';   /* terminar a string C */
+                    if (fmt == FORMAT_UNKNOWN) // Se formato desconhecido
+                        fmt = detect_format(linha); // Detetar formato
 
-                    /* Detectar formato apenas uma vez por ficheiro */
-                    if (fmt == FORMAT_UNKNOWN)
-                        fmt = detect_format(linha);
+                    LogEntry entry; // Declarar entrada
+                    if (parse_line(linha, fmt, &entry) == 0) // Se parsing ok
+                        update_metrics(m, &entry); // Atualizar métricas
 
-                    /* Parsear a linha e obter um LogEntry normalizado */
-                    LogEntry entry;
-                    if (parse_line(linha, fmt, &entry) == 0)
-                        update_metrics(m, &entry);  /* incrementar contadores */
-
-                    len = 0;   /* reiniciar para a próxima linha */
+                    len = 0; // Resetar comprimento
                 }
-            } else if (c != '\r') {
-                /* Acumular o byte (ignorar \r de ficheiros Windows) */
-                if (len < LINE_MAX_BASIC - 1)
-                    linha[len++] = c;
-                /* Se a linha for mais longa que LINE_MAX_BASIC, os bytes extra
-                 * são descartados silenciosamente (truncagem segura). */
+            } else if (c != '\r') { // Se não carriage return
+                if (len < LINE_MAX_BASIC - 1) // Se espaço na linha
+                    linha[len++] = c; // Adicionar caracter
             }
         }
     }
 
-    /* Verificar erro real de read() (n < 0) */
-    if (n < 0)
-        perror("read");
+    if (n < 0) // Se erro de leitura
+        perror("read"); // Imprimir erro
 
-    /* Processar a última linha caso o ficheiro não termine em '\n' */
-    if (len > 0) {
-        linha[len] = '\0';
-        if (fmt == FORMAT_UNKNOWN)
-            fmt = detect_format(linha);
-        LogEntry entry;
-        if (parse_line(linha, fmt, &entry) == 0)
-            update_metrics(m, &entry);
+    if (len > 0) { // Se linha no fim sem newline
+        linha[len] = '\0'; // Terminar string
+        if (fmt == FORMAT_UNKNOWN) // Se formato desconhecido
+            fmt = detect_format(linha); // Detetar formato
+        LogEntry entry; // Declarar entrada
+        if (parse_line(linha, fmt, &entry) == 0) // Se parsing ok
+            update_metrics(m, &entry); // Atualizar métricas
     }
 
-    /*
-     * close() — liberta o file descriptor no núcleo do SO.
-     * Não fechar um fd é uma fuga de recursos (fd leak).
-     */
-    if (close(fd) < 0)
-        perror("close");
+    if (close(fd) < 0) // Se erro ao fechar
+        perror("close"); // Imprimir erro
 
-    return 0;
+    return 0; // Retornar sucesso
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * escrever_resultados
- *
- * Cria results_<pid>.txt e regista uma linha por ficheiro processado.
- * Usa open()/write() — sem fprintf(), sem fwrite().
- * ═══════════════════════════════════════════════════════════════════════════ */
-
 /**
- * @brief Escreve os resultados de cada ficheiro em results_\<pid\>.txt.
- *
+ * @brief Escreve resultados em ficheiro results_<pid>.txt
+ * 
  * @details
- * Formato de cada linha (conforme enunciado §3.2.2):
- * @code
- *   PID:1234;FICHEIRO:access.log;LINHAS:50000;ERRORS:234;WARNINGS:1205
- * @endcode
- *
- * Chamadas POSIX usadas:
- *  - open()  com O_WRONLY|O_CREAT|O_TRUNC para criar/substituir o ficheiro.
- *  - write() para escrever cada linha.
- *  - close() para fechar o descritor.
- *
- * @param pid                   PID do processo filho (determina o nome do ficheiro).
- * @param ficheiros             Array de caminhos dos ficheiros processados.
- * @param total_ficheiros       Número de ficheiros no array.
- * @param metricas_por_ficheiro Array paralelo com as métricas de cada ficheiro.
+ * Cria ficheiro de output com formato especificado no enunciado.
+ * Uma linha por ficheiro processado com estatísticas.
+ * 
+ * @param pid PID do processo (para nome do ficheiro)
+ * @param ficheiros Array de caminhos processados
+ * @param total_ficheiros Número de ficheiros
+ * @param metricas_por_ficheiro Array de métricas por ficheiro
  */
-static void escrever_resultados(pid_t pid,
+static void escrever_resultados(pid_t pid, // Função para escrever resultados
                                 char **ficheiros, int total_ficheiros,
                                 const Metrics *metricas_por_ficheiro) {
-    /* Construir o nome "results_<pid>.txt" */
-    char caminho_resultado[64];
-    snprintf(caminho_resultado, sizeof(caminho_resultado), "results_%d.txt", (int)pid);
+    char caminho_resultado[64]; // Declarar buffer para caminho
+    snprintf(caminho_resultado, sizeof(caminho_resultado), "results_%d.txt", (int)pid); // Construir nome
 
-    /*
-     * open() com flags de criação:
-     *   O_WRONLY  — abrir apenas para escrita
-     *   O_CREAT   — criar o ficheiro se não existir
-     *   O_TRUNC   — apagar conteúdo anterior se já existir
-     * 0644 — permissões: dono lê+escreve, grupo e outros só lêem
-     */
-    int fd = open(caminho_resultado, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) {
-        perror("open results");
-        return;
+    int fd = open(caminho_resultado, O_WRONLY | O_CREAT | O_TRUNC, 0644); // Abrir ficheiro para escrita
+    if (fd < 0) { // Se erro ao abrir
+        perror("open results"); // Imprimir erro
+        return; // Retornar
     }
 
-    /* Escrever uma linha por ficheiro processado */
-    for (int i = 0; i < total_ficheiros; i++) {
-        /* Extrair apenas o nome base (sem a parte do directório) */
-        const char *nome = strrchr(ficheiros[i], '/');
-        nome = (nome != NULL) ? nome + 1 : ficheiros[i];
+    for (int i = 0; i < total_ficheiros; i++) { // Ciclo para cada ficheiro
+        const char *nome = strrchr(ficheiros[i], '/'); // Procurar último /
+        nome = (nome != NULL) ? nome + 1 : ficheiros[i]; // Usar nome base
 
-        /*
-         * Formato obrigatório conforme enunciado §3.2.2:
-         *   PID:<pid>;FICHEIRO:<nome>;LINHAS:<n>;ERRORS:<n>;WARNINGS:<n>
-         */
-        char linha[512];
-        int len = snprintf(linha, sizeof(linha),
+        char linha[512]; // Declarar linha
+        int len = snprintf(linha, sizeof(linha), // Construir linha
                            "PID:%d;FICHEIRO:%s;LINHAS:%ld;ERRORS:%ld;WARNINGS:%ld\n",
                            (int)pid,
                            nome,
@@ -240,284 +147,149 @@ static void escrever_resultados(pid_t pid,
                            metricas_por_ficheiro[i].count_error,
                            metricas_por_ficheiro[i].count_warn);
 
-        /*
-         * write() — escreve exactamente len bytes no fd.
-         * Verificar o retorno é obrigatório (o disco pode estar cheio).
-         */
-        if (write(fd, linha, (size_t)len) < 0)
-            perror("write results");
+        if (write(fd, linha, (size_t)len) < 0) // Se erro ao escrever
+            perror("write results"); // Imprimir erro
     }
 
-    if (close(fd) < 0)
-        perror("close results");
+    if (close(fd) < 0) // Se erro ao fechar
+        perror("close results"); // Imprimir erro
 
-    posix_writef(STDOUT_FILENO,
+    posix_writef(STDOUT_FILENO, // Imprimir mensagem
                  "[PID %d] Resultados escritos em %s\n", (int)pid, caminho_resultado);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * run_worker_basic
- *
- * Código do processo filho após fork().
- * Opera de forma completamente independente — sem IPC, sem shared memory.
- * ═══════════════════════════════════════════════════════════════════════════ */
-
 /**
- * @brief Ponto de entrada do processo filho.
- *
+ * @brief Ponto de entrada do processo filho
+ * 
  * @details
- * Cada filho recebe a sua lista de ficheiros, processa-os um a um
- * e escreve os resultados finais em results_\<pid\>.txt.
- * Esta função chama exit() no final — nunca retorna.
- *
- * @note Não existe nenhum mecanismo de IPC neste fluxo.
- *       Os processos filho nunca comunicam com o pai durante a execução.
- *
- * @param ficheiros       Array de caminhos dos ficheiros a processar.
- * @param total_ficheiros Número de ficheiros no array.
- * @param verbose         1 para modo verboso, 0 para silencioso.
+ * Cada filho processa sua lista de ficheiros de forma independente.
+ * Escreve resultados em ficheiro próprio. Chama exit() no fim.
+ * 
+ * @param ficheiros Array de ficheiros a processar
+ * @param total_ficheiros Número de ficheiros
+ * @param verbose Flag para output detalhado
  */
-static void run_worker_basic(char **ficheiros, int total_ficheiros, int verbose) {
-    pid_t pid = getpid();   /* getpid() devolve o PID deste processo */
+static void run_worker_basic(char **ficheiros, int total_ficheiros, int verbose) { // Função do worker
+    pid_t pid = getpid(); // Obter PID
 
-    /*
-     * Alocar um array de Metrics — uma entrada por ficheiro.
-     * calloc() inicializa tudo a zero (equivalente a malloc + memset(0)).
-     */
-    Metrics *metricas = calloc((size_t)total_ficheiros, sizeof(Metrics));
-    if (!metricas) {
-        perror("calloc");
-        exit(EXIT_FAILURE);
+    Metrics *metricas = calloc((size_t)total_ficheiros, sizeof(Metrics)); // Alocar métricas
+    if (!metricas) { // Se erro
+        perror("calloc"); // Imprimir erro
+        exit(EXIT_FAILURE); // Sair com erro
     }
 
-    /* Processar cada ficheiro de forma independente */
-    for (int i = 0; i < total_ficheiros; i++) {
-        init_metrics(&metricas[i]);   /* garantir zeros antes de começar */
-        processar_ficheiro(ficheiros[i], &metricas[i], verbose, pid);
+    for (int i = 0; i < total_ficheiros; i++) { // Ciclo para cada ficheiro
+        init_metrics(&metricas[i]); // Inicializar métricas
+        processar_ficheiro(ficheiros[i], &metricas[i], verbose, pid); // Processar
     }
 
-    /* Escrever todos os resultados num único ficheiro results_<pid>.txt */
-    escrever_resultados(pid, ficheiros, total_ficheiros, metricas);
+    escrever_resultados(pid, ficheiros, total_ficheiros, metricas); // Escrever resultados
 
-    free(metricas);
-
-    /*
-     * exit() — termina este processo filho.
-     * O pai vai recolher o status com waitpid() para evitar zombies.
-     */
-    exit(EXIT_SUCCESS);
+    free(metricas); // Libertar memória
+    exit(0); // Sair com sucesso
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * libertar_ficheiros  —  utilitário de limpeza
- * ═══════════════════════════════════════════════════════════════════════════ */
-
 /**
- * @brief Liberta a memória alocada para o array de caminhos de ficheiros.
- *
- * @param ficheiros Array de strings alocadas com strdup().
- * @param total     Número de entradas no array.
+ * @brief Função principal do processo PAI
+ * 
+ * @details
+ * Descobre ficheiros, divide entre N filhos, aguarda conclusão.
+ * 
+ * @param argc Número de argumentos
+ * @param argv Argumentos: programa, diretório, num_processos, modo, [--verbose]
+ * @return 0 em sucesso, 1 em erro
  */
-static void libertar_ficheiros(char **ficheiros, int total) {
-    if (!ficheiros) return;
-    for (int i = 0; i < total; i++) free(ficheiros[i]);
-    free(ficheiros);
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * MAIN
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-/**
- * @brief Ponto de entrada — Fase 1B: multi-processo sem IPC.
- *
- * @param argc Número de argumentos.
- * @param argv argv[1] = directório, argv[2] = num_processos, argv[3] = modo.
- * @return EXIT_SUCCESS (0) ou EXIT_FAILURE (1).
- */
-int main(int argc, char *argv[]) {
-
-    /* Validar número mínimo de argumentos */
-    if (argc < 4) {
-        posix_writef(STDOUT_FILENO,
-                     "Uso: %s <diretorio_logs> <num_processos> <modo> [--verbose]\n",
-                     argv[0]);
-        exit(EXIT_FAILURE);
+int main(int argc, char *argv[]) { // Função principal
+    if (argc < 4) { // Se argumentos insuficientes
+        printf("Uso: %s <diretorio> <num_processos> <modo> [--verbose]\n", argv[0]); // Imprimir uso
+        exit(1); // Sair com erro
     }
 
-    char *diretorio   = argv[1];
+    char *diretorio     = argv[1]; // Obter diretório
+    int   num_processos = atoi(argv[2]); // Converter número de processos
+    char *modo          = argv[3]; // Obter modo
 
-    /*
-     * Validar num_processos com strtol() em vez de atoi().
-     * atoi() não reporta erros; strtol() usa errno e o ponteiro fim
-     * para distinguir "4" de "abc" ou de "0".
-     */
-    errno = 0;
-    char *fim = NULL;
-    long  val = strtol(argv[2], &fim, 10);
-    if (errno != 0 || fim == argv[2] || *fim != '\0' || val <= 0) {
-        posix_writef(STDERR_FILENO, "Numero de processos invalido: %s\n", argv[2]);
-        exit(EXIT_FAILURE);
-    }
-    int num_processos = (int)val;
-
-    char *modo  = argv[3];
-    int verbose = 0;
-
-    /* Percorrer todos os argumentos opcionais */
-    for (int i = 4; i < argc; i++) {
-        if (strcmp(argv[i], "--verbose") == 0) verbose = 1;
+    int verbose = 0; // Inicializar verbose
+    for (int i = 4; i < argc; i++) { // Ciclo para argumentos
+        if (strcmp(argv[i], "--verbose") == 0) verbose = 1; // Se verbose
     }
 
-    /*
-     * Configurar o modo de análise no parser global.
-     * Só eventos relevantes para o modo passam em parse_line().
-     */
-    if (parser_set_mode_from_string(modo) != 0) {
-        posix_writef(STDERR_FILENO,
-                     "Modo invalido: %s (use security|performance|traffic|full)\n", modo);
-        exit(EXIT_FAILURE);
+    if (parser_set_mode_from_string(modo) != 0) { // Se erro no modo
+        fprintf(stderr, "Modo invalido: %s\n", modo); // Imprimir erro
+        exit(1); // Sair com erro
     }
 
-    /* ── 1. Descobrir ficheiros .log e .json no directório ── */
+    int   capacidade      = 10; // Inicializar capacidade
+    int   total_ficheiros = 0; // Inicializar total
+    char **ficheiros      = malloc((size_t)capacidade * sizeof(char *)); // Alocar array
 
-    int   capacidade      = 16;   /* começa com 16; duplica quando necessário */
-    int   total_ficheiros = 0;
-    char **ficheiros = malloc((size_t)capacidade * sizeof(char *));
-    if (!ficheiros) { perror("malloc"); exit(EXIT_FAILURE); }
+    DIR *dir = opendir(diretorio); // Abrir diretório
+    if (dir == NULL) { perror("opendir"); exit(1); } // Se erro, sair
 
-    /*
-     * opendir() / readdir() / closedir() — API POSIX para iterar directórios.
-     * Cada struct dirent representa uma entrada (ficheiro, sub-directório, etc.).
-     */
-    DIR *dir = opendir(diretorio);
-    if (!dir) { perror("opendir"); exit(EXIT_FAILURE); }
+    struct dirent *entrada; // Declarar entrada
+    while ((entrada = readdir(dir)) != NULL) { // Ciclo enquanto há entradas
+        char *nome = entrada->d_name; // Obter nome
+        size_t len = strlen(nome); // Obter comprimento
 
-    struct dirent *entrada;
-    while ((entrada = readdir(dir)) != NULL) {
-        int len   = (int)strlen(entrada->d_name);
-        int e_log  = (len > 4 && strcmp(entrada->d_name + len - 4, ".log")  == 0);
-        int e_json = (len > 5 && strcmp(entrada->d_name + len - 5, ".json") == 0);
-
-        if (!e_log && !e_json) continue;   /* ignorar ficheiros de outro tipo */
-
-        /* Crescer o array com realloc() se atingirmos a capacidade actual */
-        if (total_ficheiros == capacidade) {
-            capacidade *= 2;
-            ficheiros = realloc(ficheiros, (size_t)capacidade * sizeof(char *));
-            if (!ficheiros) { perror("realloc"); exit(EXIT_FAILURE); }
+        if (!((len > 4 && strcmp(nome + len - 4, ".log") == 0) || // Se not .log
+              (len > 5 && strcmp(nome + len - 5, ".json") == 0))) { // Se not .json
+            continue; // Continuar
         }
 
-        /* Guardar o caminho completo "directório/ficheiro.log" */
-        char caminho[512];
-        snprintf(caminho, sizeof(caminho), "%s/%s", diretorio, entrada->d_name);
-        ficheiros[total_ficheiros++] = strdup(caminho);   /* cópia própria */
-    }
-    closedir(dir);
-
-    if (total_ficheiros == 0) {
-        posix_writef(STDOUT_FILENO,
-                     "Nenhum ficheiro .log ou .json encontrado em: %s\n", diretorio);
-        free(ficheiros);
-        exit(EXIT_SUCCESS);
-    }
-
-    /* Não criar mais processos do que ficheiros existentes */
-    if (num_processos > total_ficheiros)
-        num_processos = total_ficheiros;
-
-    posix_writef(STDOUT_FILENO,
-                 "Ficheiros: %d | Workers: %d | Modo: %s\n",
-                 total_ficheiros, num_processos, modo);
-    posix_writef(STDOUT_FILENO,
-                 "[Req. B] Sem IPC — cada filho escreve results_<pid>.txt de forma independente.\n\n");
-
-    /* ── 2. Lançar N processos filho com fork() ── */
-
-    pid_t *pids = malloc((size_t)num_processos * sizeof(pid_t));
-    if (!pids) { perror("malloc pids"); exit(EXIT_FAILURE); }
-
-    /*
-     * fflush(NULL) garante que os buffers do stdio estão vazios ANTES do fork().
-     * Sem isto, mensagens impressas antes do fork() poderiam ser duplicadas
-     * (o filho herda o conteúdo dos buffers não descarregados do pai).
-     */
-    fflush(NULL);
-
-    for (int i = 0; i < num_processos; i++) {
-
-        /*
-         * Distribuição por blocos:
-         * Filho i processa os ficheiros do índice inicio ao fim (bloco contíguo).
-         * Alternativa: round-robin (ficheiros i, i+N, i+2N) — igualmente válida.
-         */
-        int por_worker = total_ficheiros / num_processos;
-        int extra      = total_ficheiros % num_processos;   /* ficheiros a mais */
-        int inicio     = i * por_worker + (i < extra ? i       : extra);
-        int fim_bloco  = inicio + por_worker   + (i < extra ? 1 : 0);
-        int count      = fim_bloco - inicio;
-
-        /*
-         * fork() — chamada fundamental de criação de processos em UNIX.
-         * Duplica o processo actual (espaço de endereçamento, descritores, etc.).
-         * Retorna:
-         *   0   → estamos no processo FILHO
-         *   >0  → estamos no processo PAI; o valor é o PID do filho criado
-         *   -1  → erro (não foi criado nenhum processo filho)
-         */
-        pid_t pid = fork();
-        if (pid < 0) { perror("fork"); exit(EXIT_FAILURE); }
-
-        if (pid == 0) {
-            /* ═══ CÓDIGO DO FILHO ═══
-             *
-             * O filho tem acesso aos ponteiros do array `ficheiros` porque
-             * fork() faz uma cópia (copy-on-write) do espaço de endereçamento.
-             * Passamos apenas os ponteiros do nosso bloco — não os copiamos.
-             */
-            run_worker_basic(&ficheiros[inicio], count, verbose);
-            /* run_worker_basic() chama exit() — o filho nunca regressa aqui */
+        if (total_ficheiros == capacidade) { // Se capacidade atingida
+            capacidade *= 2; // Duplicar capacidade
+            ficheiros = realloc(ficheiros, (size_t)capacidade * sizeof(char *)); // Realocar
         }
 
-        /* ═══ CÓDIGO DO PAI ═══ (pid > 0) */
-        pids[i] = pid;   /* guardar PID para mais tarde usar em waitpid() */
+        char caminho[512]; // Declarar caminho
+        snprintf(caminho, sizeof(caminho), "%s/%s", diretorio, nome); // Construir caminho
+        ficheiros[total_ficheiros++] = strdup(caminho); // Guardar cópia
+    }
+    closedir(dir); // Fechar diretório
 
-        posix_writef(STDOUT_FILENO,
-                     "Worker %d lançado — PID %d — %d ficheiro(s)\n",
-                     i, (int)pid, count);
+    if (total_ficheiros == 0) { // Se sem ficheiros
+        printf("Nenhum ficheiro encontrado.\n"); // Imprimir mensagem
+        free(ficheiros); // Libertar memória
+        exit(0); // Sair
     }
 
-    /* ── 3. Aguardar todos os filhos com waitpid() ── */
+    printf("Ficheiros encontrados: %d | Workers: %d | Modo: %s\n\n", // Imprimir resumo
+           total_ficheiros, num_processos, modo);
 
-    posix_writef(STDOUT_FILENO, "\nA aguardar filhos...\n");
+    int ficheiros_por_worker = total_ficheiros / num_processos; // Calcular por worker
+    int ficheiros_extra = total_ficheiros % num_processos; // Calcular extra
 
-    for (int i = 0; i < num_processos; i++) {
-        int status;
+    fflush(NULL); // Esvaziar buffers
 
-        /*
-         * waitpid(pid, &status, 0) — bloqueia o pai até o filho terminar.
-         * Sem esta chamada os filhos ficam como processos "zombie"
-         * (terminados mas com entrada na tabela de processos do kernel).
-         *
-         * WIFEXITED(status)   — o filho terminou normalmente com exit()?
-         * WEXITSTATUS(status) — qual foi o código de saída?
-         */
-        if (waitpid(pids[i], &status, 0) < 0) {
-            perror("waitpid");
-        } else if (WIFEXITED(status) && WEXITSTATUS(status) != 0) {
-            posix_writef(STDERR_FILENO,
-                         "Worker PID %d terminou com erro %d\n",
-                         (int)pids[i], WEXITSTATUS(status));
+    pid_t *pids = malloc((size_t)num_processos * sizeof(pid_t)); // Alocar PIDs
+
+    for (int i = 0; i < num_processos; i++) { // Ciclo para criar filhos
+        int inicio = i * ficheiros_por_worker + (i < ficheiros_extra ? i : ficheiros_extra); // Calcular início
+        int fim = inicio + ficheiros_por_worker + (i < ficheiros_extra ? 1 : 0); // Calcular fim
+
+        pid_t pid = fork(); // Criar processo filho
+        if (pid < 0) { perror("fork"); exit(1); } // Se erro, sair
+
+        if (pid == 0) { // Se processo filho
+            run_worker_basic(&ficheiros[inicio], fim - inicio, verbose); // Executar worker
+            exit(0); // Sair
         }
+
+        pids[i] = pid; // Guardar PID
     }
 
-    posix_writef(STDOUT_FILENO,
-                 "\nTodos os workers terminaram.\n"
-                 "Resultados em: results_<pid>.txt (um por worker)\n");
+    for (int i = 0; i < num_processos; i++) { // Ciclo para cada worker
+        int status; // Declarar status
+        waitpid(pids[i], &status, 0); // Esperar worker
+        if (WIFEXITED(status) && WEXITSTATUS(status) != 0) // Se terminou com erro
+            fprintf(stderr, "Worker %d terminou com erro\n", i); // Imprimir erro
+    }
 
-    /* ── Limpeza de memória ── */
-    free(pids);
-    libertar_ficheiros(ficheiros, total_ficheiros);
+    printf("\nTodos os processos terminaram.\n"); // Imprimir mensagem
 
-    return EXIT_SUCCESS;
+    for (int i = 0; i < total_ficheiros; i++) free(ficheiros[i]); // Libertar strings
+    free(ficheiros); // Libertar array
+    free(pids); // Libertar PIDs
+
+    return 0; // Retornar sucesso
 }
