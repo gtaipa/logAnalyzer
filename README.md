@@ -5,7 +5,8 @@ programação concorrente via processos POSIX e threads POSIX.
 
 ## Autores
 
-- Pedro José Abreu Rodrigues (pedrojoseabreurodrigues@gmail.com)
+- Pedro José Abreu Rodrigues (2024114929@ufp.edu.pt)
+- Guilherme Taipa Nunes(2024118263@ufp.edu.pt)
 
 ## Requisitos
 
